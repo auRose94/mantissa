@@ -137,7 +137,7 @@ class Optimisations(unittest.TestCase):
             x = x * 8.0
         """)
         # 8.0 once in the pool; the initialiser's own load is the other one
-        self.assertEqual(text.count("LDI.D"), 2, text)
+        self.assertEqual(text.count("LDI.D"), 2, text)  # 8.0 once in the pool, + the SIZE register
         self.assertEqual(text.count("8.0"), 1, "the constant appears once, in the pool")
         self.assertIn("the literal pool", text)
 
@@ -185,3 +185,115 @@ class DisassemblerRoundTrip(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Arrays(unittest.TestCase):
+    def check(self, source, expected_lines):
+        out, result, warnings, _ = run_program(source)
+        self.assertEqual(result.reason, "halt", result.cpu.fault)
+        self.assertEqual(out.splitlines(), [f"{v!r}" for v in expected_lines])
+        return warnings
+
+    def test_fill_sum_and_read(self):
+        self.check("""
+            array a[10]
+            var i = 0.0
+            var sum = 0.0
+            while i < 10.0 {
+                a[i] = i * i
+                i = i + 1.0
+            }
+            i = 0.0
+            while i < 10.0 {
+                sum = sum + a[i]
+                i = i + 1.0
+            }
+            print sum
+            print a[3]
+        """, [285.0, 9.0])
+
+    def test_reverse_in_place(self):
+        self.check("""
+            array a[6]
+            var i = 0.0
+            while i < 6.0 {
+                a[i] = i + 1.0
+                i = i + 1.0
+            }
+            var lo = 0.0
+            var hi = 5.0
+            var t = 1.0
+            while lo < hi {
+                var tmp = a[lo]
+                a[lo] = a[hi]
+                a[hi] = tmp
+                lo = lo + t
+                hi = hi - t
+            }
+            print a[0]
+            print a[5]
+        """, [6.0, 1.0])
+
+    def test_arrays_are_zero_filled(self):
+        self.check("array a[4]\nprint a[0]\nprint a[3]\n", [0.0, 0.0])
+
+    def test_index_expressions_and_reads_in_expressions(self):
+        self.check("""
+            array a[4]
+            a[0] = 10.0
+            a[1] = 20.0
+            a[2] = a[0] + a[1]
+            print a[2] * 2.0 - a[0] - a[1]
+        """, [30.0])
+
+    def test_two_arrays(self):
+        self.check("""
+            array a[4]
+            array b[4]
+            var i = 0.0
+            while i < 4.0 {
+                a[i] = i + 1.0
+                b[i] = a[i] * 10.0
+                i = i + 1.0
+            }
+            print b[2]
+        """, [30.0])
+
+    def test_a_fractional_index_faults_the_machine(self):
+        # run through the reference: the fractional address must fault
+        text, image, _ = m4c.compile_source("""
+            array a[4]
+            var i = 1.5
+            a[i] = 7.0
+            print a[1]
+        """)
+        memory = Memory(4096)
+        memory.write(image.cells)
+        result = run(Cpu(f=(0.0,) * 31 + (4096.0,), pc=image.entry), memory, max_steps=1000)
+        self.assertEqual(result.reason, "fault")
+        self.assertEqual(result.cpu.fault.kind, "address")
+        self.assertIn("multiple of 4", result.cpu.fault.detail)
+
+    def test_array_errors(self):
+        with self.assertRaises(m4c.CompileError) as caught:
+            m4c.compile_source("array a[4]\nprint b[0]\n")
+        self.assertIn("never declared", str(caught.exception))
+        with self.assertRaises(m4c.CompileError) as caught:
+            m4c.compile_source("var x = 1.0\nprint x[0]\n")
+        self.assertIn("cannot be indexed", str(caught.exception))
+        with self.assertRaises(m4c.CompileError) as caught:
+            m4c.compile_source("array a[4]\nx = 1.0\n")
+        self.assertIn("never declared", str(caught.exception))
+        with self.assertRaises(m4c.CompileError) as caught:
+            m4c.compile_source("array a[4]\narray a[8]\n")
+        self.assertIn("declared twice", str(caught.exception))
+        with self.assertRaises(m4c.CompileError) as caught:
+            m4c.compile_source("array a[0]\n")
+        self.assertIn("positive whole number", str(caught.exception))
+
+    def test_the_space_is_reserved_aligned_and_before_the_code(self):
+        text, image, _ = m4c.compile_source("array a[4]\narray b[2]\nprint b[1]\n")
+        self.assertIn("a:     SPACE 16", text)
+        self.assertIn("b:     SPACE 8", text)
+        self.assertLess(text.index("b:     SPACE"), text.index("LDI.D  d6"))
+        self.assertEqual(list(image.cells[:16]), [0] * 16)  # zero-filled, before the code

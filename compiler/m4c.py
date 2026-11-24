@@ -6,10 +6,10 @@
 The language (v0):
 
     var x = 0.0                 every variable is a double, forever
-    var i = 0.0
+    array a[10]                 arrays live in memory, doubles, zero-filled
+    a[0] = 1.5
+    print a[0] + x              the console spells the value; the machine hands it over
     while i < 10.0 { ... }      while, if, else, with { } blocks
-    x = x + 1.0
-    print x                     the console spells the value; the machine hands it over
 
     expressions: + - * / < <= > >= == !=, numbers, variables, and
     sqrt(x) fma(a, b, c) floor(x) ceil(x) chop(x) round(x) min(a, b) max(a, b)
@@ -20,6 +20,13 @@ There are no integers in the language because there are none in the machine.
 Counters count while their format keeps step: a double counts to 2^53.  The
 compiler warns when a comparison uses a bound in the awkward band above half a
 counting wall, where the programmer is probably assuming the wrong format.
+
+Arrays are 1D blocks of doubles in memory: `array a[16]` reserves 64 cells
+(zero-filled) at a 4-cell-aligned label, and `a[i]` compiles to the address
+`a + 4*i` in a float register plus one LD or ST.  The index is not chopped:
+a fractional index makes a fractional cell address, and the machine faults
+on it -- exactly the fault a whole-number machine would give.  There are no
+bounds checks: an address past the end of memory faults the same way.
 
 How it compiles: the machine's arithmetic is three-address, so an expression
 evaluates onto a stack of temporary registers and a variable's own register is
@@ -46,8 +53,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mantissa import asm, fp  # noqa: E402
 
-TEMP_LOW, TEMP_HIGH = 8, 28   # d8..d27 are the expression stack; d0..d7 are variables
-MAX_VARIABLES = TEMP_LOW
+TEMP_LOW, TEMP_HIGH = 8, 28   # d8..d27 are the expression stack; d0..d5 are variables
+SIZE_REG = "d6"              # holds the element size 4.0, for array addressing
+MAX_VARIABLES = 6
 WALLS = {2048.0: "half", 16777216.0: "float", 9007199254740992.0: "double"}
 
 BINARY_OPS = {"add": "ADD", "sub": "SUB", "mul": "MUL", "div": "DIV",
@@ -105,7 +113,7 @@ def lex(source):
         elif source[i:i + 2] in ("<=", ">=", "==", "!="):
             tokens.append((line, "op", source[i:i + 2]))
             i += 2
-        elif c in "+-*/<>=(){},;":
+        elif c in "+-*/<>=(){},;[]":
             tokens.append((line, "op", c))
             i += 1
         else:
@@ -162,6 +170,17 @@ class Parser:
                     continue
                 break
             self.semicolon()
+        elif kind == "name" and value == "array":
+            self.take()
+            line2, name = self.expect("name")
+            self.expect("op", "[")
+            line3, size_kind, size = self.take()
+            if size_kind != "num" or size != int(size) or size <= 0:
+                raise CompileError(line2, f"the array size must be a positive whole number, "
+                                          f"not {size!r}")
+            self.expect("op", "]")
+            self.semicolon()
+            into.append(["arraydecl", line2, name, int(size)])
         elif kind == "name" and value == "while":
             self.take()
             condition = self.expression()
@@ -188,9 +207,17 @@ class Parser:
             into.append(["print", line, self.expression()])
         elif kind == "name":
             line2, _, name = self.take()
-            self.expect("op", "=")
-            into.append(["assign", line2, name, self.expression()])
-            self.semicolon()
+            if self.peek()[1] == "op" and self.peek()[2] == "[":
+                self.take()
+                index = self.expression()
+                self.expect("op", "]")
+                self.expect("op", "=")
+                into.append(["astore", line2, name, index, self.expression()])
+                self.semicolon()
+            else:
+                self.expect("op", "=")
+                into.append(["assign", line2, name, self.expression()])
+                self.semicolon()
         else:
             raise CompileError(line, f"expected a statement, found '{value or kind}'")
 
@@ -240,6 +267,11 @@ class Parser:
                     args.append(self.expression())
                 self.expect("op", ")")
                 return ("call", line, value, args)
+            if self.peek()[1] == "op" and self.peek()[2] == "[":
+                self.take()
+                index = self.expression()
+                self.expect("op", "]")
+                return ("index", line, value, index)
             if value in ("inf", "nan"):
                 return ("num", line, float(value))
             return ("var", line, value)
@@ -373,7 +405,10 @@ def check_walls(nodes, warnings):
     for node in nodes:
         kind = node[0]
         if kind == "assign":
-            check_walls([node], warnings) if False else check_walls_expr(node[3], warnings)
+            check_walls_expr(node[3], warnings)
+        elif kind == "astore":
+            check_walls_expr(node[3], warnings)
+            check_walls_expr(node[4], warnings)
         elif kind == "print":
             check_walls_expr(node[2], warnings)
         elif kind == "while":
@@ -413,6 +448,7 @@ class Compiler:
     def __init__(self):
         self.variables = {}
         self.variable_count = 0
+        self.arrays = {}          # name -> elements
         self.lines = []
         self.labels = 0
         self.pool = {}
@@ -454,6 +490,23 @@ class Compiler:
             if name not in self.variables:
                 raise CompileError(line, f"'{name}' was never declared")
             return self.variables[name], False
+        if kind == "index":
+            _, line, name, index = node
+            if name not in self.arrays:
+                what = "is declared as a scalar" if name in self.variables else "was never declared"
+                raise CompileError(line, f"'{name}' {what}; it cannot be indexed")
+            r_i, owned_i = self.expr(index)
+            scratch = self.take_temp()
+            self.emit(f"MUL.D  {scratch}, {r_i}, {SIZE_REG}")
+            self.emit(f"CVT.F  f1, {scratch}")
+            self.emit(f"LDI.F  f0, {name}")
+            self.emit(f"ADD.F  f0, f0, f1")
+            out = self.take_temp()
+            self.emit(f"LD.D   {out}, [f0]")
+            if owned_i:
+                self.give_temp(r_i)
+            self.give_temp(scratch)
+            return out, True
         if kind == "neg":
             register, owned = self.expr(node[2])
             if owned:
@@ -513,7 +566,28 @@ class Compiler:
         elif self.pending_zero is not None:
             self.emit(f"LDI.D  {self.pending_zero}, 0.0")
             self.pending_zero = None
-        if kind == "var":
+        if kind == "arraydecl":
+            _, line, name, elements = node
+            self.arrays[name] = elements   # registered in the pre-pass; SPACE emitted first
+        elif kind == "astore":
+            _, line, name, index, value = node
+            if name not in self.arrays:
+                what = "is declared as a scalar" if name in self.variables else "was never declared"
+                raise CompileError(line, f"'{name}' {what}; it cannot be indexed")
+            r_v, owned_v = self.expr(value)
+            r_i, owned_i = self.expr(index)
+            scratch = self.take_temp()
+            self.emit(f"MUL.D  {scratch}, {r_i}, {SIZE_REG}")
+            self.emit(f"CVT.F  f1, {scratch}")
+            self.emit(f"LDI.F  f0, {name}")
+            self.emit(f"ADD.F  f0, f0, f1")
+            self.emit(f"ST.D   [f0], {r_v}")
+            if owned_v:
+                self.give_temp(r_v)
+            if owned_i:
+                self.give_temp(r_i)
+            self.give_temp(scratch)
+        elif kind == "var":
             _, line, name = node
             if name in self.variables:
                 raise CompileError(line, f"'{name}' is declared twice")
@@ -600,6 +674,19 @@ def compile_source(source):
     compiler.pool_values = {fp.to_bits(fp.D, value): value
                             for value, uses in pool.items() if fp.to_bits(fp.D, value) in compiler.pool}
     compiler.free_temps = list(range(TEMP_HIGH - 1 - len(compiler.pool), TEMP_LOW - 1, -1))
+    # the arrays' space comes first in the image: position 0 is 4-cell aligned,
+    # and every array's size is a multiple of 4 cells, so all bases stay aligned
+    array_lines = []
+    for node in statements:
+        if node[0] == "arraydecl":
+            if node[2] in compiler.arrays or node[2] in compiler.variables:
+                raise CompileError(node[1], f"'{node[2]}' is declared twice")
+            compiler.arrays[node[2]] = node[3]
+            array_lines.append(f"{node[2]}:     SPACE {4 * node[3]}")
+    for line in array_lines:
+        compiler.emit(line)
+    if compiler.arrays:
+        compiler.emit(f"LDI.D  {SIZE_REG}, 4.0      ; the element size, for array addressing")
     for key, register in sorted(compiler.pool.items(), key=lambda kv: kv[1]):
         compiler.emit(f"LDI.D  {register}, {compiler.pool_values[key]!r}      ; the literal pool")
     for node in statements:
