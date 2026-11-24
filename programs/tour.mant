@@ -1,0 +1,43 @@
+; tour.mant -- every instruction the other demos leave out, once each.
+;
+; The ports replay recorded runs, so between them the runs should touch
+; every instruction.  This one covers the eighteen that nothing else uses.
+; Each prints what it did.
+        LDI.D  d1, 2
+        LDI.D  d2, -0.75
+        NOP
+        SQRT   d0, d1           ; the square root of 2
+        PUT.D  d0
+        FMA    d1, d1, d1       ; 2 * 2 + 2
+        PUT.D  d1
+        REM    d0, d2, d1       ; the IEEE remainder of -0.75 by 6
+        PUT.D  d0
+        MIN    d0, d1, d2
+        PUT.D  d0
+        MAX    d0, d1, d2
+        PUT.D  d0
+        NEG    d0, d1
+        PUT.D  d0
+        ABS    d0, d2
+        PUT.D  d0
+        CPSGN  d0, d1, d2       ; the size of 6 with the sign of -0.75
+        PUT.D  d0
+        FLOOR  d0, d2
+        PUT.D  d0
+        CEIL   d0, d2
+        PUT.D  d0
+        ROUND  d0, d2
+        PUT.D  d0
+        LOGB   d0, d1           ; 6 is just above 2 ** 2
+        PUT.D  d0
+        NEXT   d0, d2, d1       ; the next double toward 6
+        PUT.D  d0
+        CLASS  d0, d2           ; 3: a negative normal number
+        PUT.D  d0
+        LT     d0, d2, d1
+        PUT.D  d0
+        LE     d0, d1, d2
+        PUT.D  d0
+        EQ     d0, d1, d1
+        PUT.D  d0
+        HALT

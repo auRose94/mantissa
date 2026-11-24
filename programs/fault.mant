@@ -1,0 +1,9 @@
+; fault.mant -- jumping into data stops the machine.
+;
+; An instruction is a number, and so is data, so nothing keeps a jump out of
+; a table.  The number 1000 is not an instruction, though: its opcode digits
+; are 00.  The machine stops and says so.
+        LDI.F  f0, table
+        JMP    f0
+        HALT                   ; never reached
+table:  DATA.D 1000

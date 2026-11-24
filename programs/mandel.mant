@@ -1,0 +1,72 @@
+; mandel.mant -- an ASCII Mandelbrot set, 64 columns by 22 rows.
+;
+; All of the arithmetic is in double registers.  programs/mandel_zoom.py
+; rewrites it for half and for float and renders all three side by side, at
+; any zoom.  Addresses and loop counters stay in float registers throughout:
+; that is what they are for.
+        LDI.D  d10, -2.0         ; left edge
+        LDI.D  d11, 0.6          ; right edge
+        LDI.D  d12, -1.1         ; top edge
+        LDI.D  d13, 1.1          ; bottom edge
+        LDI.D  d14, 4            ; escape radius, squared
+        LDI.D  d15, 2
+        LDI.D  d9, 1
+        LDI.D  d8, 40            ; iterations before a point counts as inside
+        LDI.F  f2, 64            ; columns
+        LDI.F  f3, 22            ; rows
+        LDI.F  f5, 1
+        LDI.F  f6, 10            ; newline
+        LDI.F  f7, ramp
+        LDI.F  f9, 9             ; the ramp has ten characters
+        LDI.F  f10, 0.225        ; 9 / 40: spreads the iteration count over the ramp
+        LDI.F  f0, 0             ; row
+row:    LDI.F  f1, 0             ; column
+pixel:  ; cx = left + (right - left) * column / columns
+        SUB.D  d0, d11, d10
+        CVT.D  d1, f1
+        MUL.D  d0, d0, d1
+        CVT.D  d1, f2
+        DIV.D  d0, d0, d1
+        ADD.D  d0, d0, d10
+        ; cy = top + (bottom - top) * row / rows
+        SUB.D  d1, d13, d12
+        CVT.D  d7, f0
+        MUL.D  d1, d1, d7
+        CVT.D  d7, f3
+        DIV.D  d1, d1, d7
+        ADD.D  d1, d1, d12
+        LDI.D  d2, 0             ; zx
+        LDI.D  d3, 0             ; zy
+        LDI.D  d6, 0             ; n
+iter:   MUL.D  d4, d2, d2        ; zx * zx
+        MUL.D  d5, d3, d3        ; zy * zy
+        ADD.D  d7, d4, d5
+        BLE.D  d14, d7, escaped  ; |z| squared has reached 4
+        BLT.D  d6, d8, step      ; otherwise keep counting
+        SUB.F  f8, f7, f5        ; inside: the character just before the ramp
+        BR     draw
+step:   SUB.D  d7, d4, d5        ; zx * zx - zy * zy
+        MUL.D  d5, d2, d3
+        MUL.D  d5, d5, d15       ; 2 * zx * zy
+        ADD.D  d3, d5, d1        ; zy = 2 * zx * zy + cy
+        ADD.D  d2, d7, d0        ; zx = zx * zx - zy * zy + cx
+        ADD.D  d6, d6, d9        ; n = n + 1
+        BR     iter
+escaped:                        ; the character at ramp[n * 9 / 40]
+        CVT.F  f8, d6
+        MUL.F  f8, f8, f10
+        CHOP.F f8, f8
+        MIN.F  f8, f8, f9
+        ADD.F  f8, f7, f8
+draw:   LD.H   h0, [f8]
+        PUTC.H h0
+        ADD.F  f1, f1, f5        ; next column
+        BLT.F  f1, f2, pixel
+        PUTC.F f6                ; end of the row
+        ADD.F  f0, f0, f5
+        BLT.F  f0, f3, row
+        HALT
+
+inside: DATA.H 64               ; '@', for points that never escape
+ramp:   TEXT " .:-=+*#%@"      ; darker the longer it took to escape
+        DATA.H 0

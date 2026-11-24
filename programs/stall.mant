@@ -1,0 +1,15 @@
+; stall.mant -- "while (i < 2050) i += 1" never finishes in half precision.
+;
+; A half holds every whole number only up to 2048.  Above that its spacing is
+; 2, so 2048 + 1 rounds back to 2048 and the counter freezes, two short of a
+; limit it will never reach.  Nothing traps: each stalled step only sets the
+; inexact flag, and nobody is looking.  Run it with a step limit and watch:
+;
+;     python -m mantissa run programs/stall.mant --steps 36 --panel
+        LDI.H  h1, 1
+        LDI.H  h2, 2050
+        LDI.H  h0, 2045
+loop:   ADD.H  h0, h0, h1
+        PUT.H  h0
+        BLT.H  h0, h2, loop
+        HALT

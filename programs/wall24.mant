@@ -1,0 +1,40 @@
+; wall24.mant -- the same wall, in float and in double.
+;
+; A float holds every whole number only up to 16,777,216 (2**24).  Above that
+; its spacing is 2, so adding 1 changes nothing.  A double's wall is at 2**53,
+; far out of sight.  Both counters start just below the float's wall and take
+; five steps.
+        LDI.F  f1, 1
+        LDI.D  d1, 1
+        LDI.F  f0, 16777215
+        LDI.D  d0, 16777215
+        LDI.H  h9, 5
+        LDI.H  h8, 1
+again:  LDI.F  f5, t_float
+        JAL    f4, puts          ; print a label; the number follows on its own line
+        PUT.F  f0
+        LDI.F  f5, t_double
+        JAL    f4, puts
+        PUT.D  d0
+        ADD.F  f0, f0, f1
+        ADD.D  d0, d0, d1
+        SUB.H  h9, h9, h8        ; five is a safe loop counter: small numbers always are
+        BNZ.H  h9, again
+        HALT
+
+; puts: print the string of half code points at address f5, ended by a 0.
+; f4 holds the address JAL left there; jump back to it when done.
+puts:   LD.H   h0, [f5]
+        BZ.H   h0, puts_done
+        PUTC.H h0
+        LDI.H  h1, 1
+        CVT.F  f6, h1
+        ADD.F  f5, f5, f6
+        BR     puts
+puts_done:
+        JMP    f4
+
+t_float:  TEXT "float "
+          DATA.H 0
+t_double: TEXT "double "
+          DATA.H 0

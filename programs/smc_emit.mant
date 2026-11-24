@@ -1,0 +1,66 @@
+; smc_emit.mant -- a program that writes a program.
+;
+; 'emit' takes an opcode and three operand digits in d1 to d4, builds the
+; instruction number ((op * 100 + a) * 100 + b) * 100 + c, and appends it at
+; the code pointer f6.  With it, the main program writes, while it runs, an
+; unrolled loop that adds the first five odd numbers.  Then it prints what
+; it wrote, and runs it.
+        LDI.F  f6, code
+        LDI.F  f9, code          ; kept for the jump at the end
+        LDI.D  d8, 100
+        LDI.F  f10, 4
+        ; LDI h0, 1
+        LDI.D  d1, 11
+        LDI.D  d2, 0
+        LDI.D  d3, 0
+        LDI.D  d4, 0
+        JAL    f7, emit
+        LDI.D  d5, 1
+        ST.D   [f6], d5          ; the operand word of that LDI
+        ADD.F  f6, f6, f10
+        LDI.D  d5, 3             ; the next odd number
+        LDI.D  d6, 9             ; the last odd number
+        LDI.D  d7, 2
+gen:    ; LDI h1, (the odd number in d5)
+        LDI.D  d1, 11
+        LDI.D  d2, 1
+        LDI.D  d3, 0
+        LDI.D  d4, 0
+        JAL    f7, emit
+        ST.D   [f6], d5
+        ADD.F  f6, f6, f10
+        ; ADD h0, h0, h1
+        LDI.D  d1, 20
+        LDI.D  d2, 0
+        LDI.D  d3, 0
+        LDI.D  d4, 1
+        JAL    f7, emit
+        ADD.D  d5, d5, d7
+        BLE.D  d5, d6, gen
+        ; PUT h0, then HALT
+        LDI.D  d1, 70
+        LDI.D  d4, 0
+        JAL    f7, emit
+        LDI.D  d1, 2
+        JAL    f7, emit
+        ; what did it write?
+        LDI.F  f8, code
+show:   BEQ.F  f8, f6, run
+        LD.D   d0, [f8]
+        PUT.D  d0
+        ADD.F  f8, f8, f10
+        BR     show
+run:    JMP    f9
+
+; emit: append the instruction (d1 d2 d3 d4) at f6, and step f6 over it.
+emit:   MUL.D  d0, d1, d8
+        ADD.D  d0, d0, d2
+        MUL.D  d0, d0, d8
+        ADD.D  d0, d0, d3
+        MUL.D  d0, d0, d8
+        ADD.D  d0, d0, d4
+        ST.D   [f6], d0
+        ADD.F  f6, f6, f10
+        JMP    f7
+
+code:   SPACE 96                 ; room for the generated program

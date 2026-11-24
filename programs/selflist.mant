@@ -1,0 +1,56 @@
+; selflist.mant -- a program that takes its own instructions apart.
+;
+; From 'main' to 'end', every word is a number.  The instruction numbers get
+; pulled apart with chop and mod: the opcode, then the three operand fields.
+; A word whose opcode digits are 00 is not an instruction but an operand, so
+; it is printed as the number it is.  This is the other half of
+; self-modifying code: reading code as numbers.
+main:   LDI.F  f5, main          ; f5 walks the words
+        LDI.F  f6, end
+        LDI.D  d1, 100
+        LDI.D  d2, 10000
+        LDI.D  d3, 1000000
+        LDI.F  f7, 4
+        LDI.H  h9, 32            ; a space
+        LDI.H  h8, 10            ; a newline
+loop:   BEQ.F  f5, f6, end
+        LD.D   d0, [f5]
+        DIV.D  d4, d0, d3
+        CHOP.D  d4, d4           ; the opcode
+        BNZ.D  d4, instr
+        PUT.D  d0                ; opcode 00: an operand word, printed as a number
+        BR     step
+instr:  CVT.H  h0, d4
+        JAL    f4, two
+        PUTC.H h9
+        DIV.D  d4, d0, d2        ; the first operand
+        CHOP.D  d4, d4
+        MOD.D  d4, d4, d1
+        CVT.H  h0, d4
+        JAL    f4, two
+        PUTC.H h9
+        DIV.D  d4, d0, d1        ; the second operand
+        CHOP.D  d4, d4
+        MOD.D  d4, d4, d1
+        CVT.H  h0, d4
+        JAL    f4, two
+        PUTC.H h9
+        MOD.D  d4, d0, d1        ; the third operand
+        CVT.H  h0, d4
+        JAL    f4, two
+        PUTC.H h8
+step:   ADD.F  f5, f5, f7
+        BR     loop
+end:    HALT
+
+; two: print h0, a number from 0 to 99, as two digits.
+two:    LDI.H  h1, 10
+        LDI.H  h2, 48
+        DIV.H  h3, h0, h1
+        CHOP.H h3, h3
+        ADD.H  h3, h3, h2
+        PUTC.H h3
+        MOD.H  h3, h0, h1
+        ADD.H  h3, h3, h2
+        PUTC.H h3
+        JMP    f4

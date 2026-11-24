@@ -1,0 +1,54 @@
+; tenths.mant -- add 0.1 a thousand times, four ways.
+;
+; None of the three formats can hold 0.1.  Each plain sum drifts by its own
+; step size.  The fourth sum is plain float arithmetic too, but it keeps the
+; drift of each addition in a second register (Kahan compensation).
+        LDI.H  h1, 0.1
+        LDI.F  f1, 0.1
+        LDI.D  d1, 0.1
+        LDI.H  h9, 1000
+        LDI.H  h8, 1
+loop:   ADD.H  h0, h0, h1        ; half, plain
+        ADD.F  f0, f0, f1        ; float, plain
+        ADD.D  d0, d0, d1        ; double, plain
+        SUB.F  f4, f1, f3        ; float, compensated: y = term - c
+        ADD.F  f5, f2, f4        ;                    t = sum + y
+        SUB.F  f6, f5, f2        ;                    e = t - sum
+        SUB.F  f3, f6, f4        ;                    c = e - y
+        MOV.F  f2, f5            ;                    sum = t
+        SUB.H  h9, h9, h8
+        BNZ.H  h9, loop
+        LDI.F  f5, t_half
+        JAL    f20, puts
+        PUT.H  h0
+        LDI.F  f5, t_float
+        JAL    f20, puts
+        PUT.F  f0
+        LDI.F  f5, t_double
+        JAL    f20, puts
+        PUT.D  d0
+        LDI.F  f5, t_kahan
+        JAL    f20, puts
+        PUT.F  f2
+        HALT
+
+; puts: print the string of half code points at address f5, ended by a 0.
+; f20 holds the address JAL left there; jump back to it when done.
+puts:   LD.H   h7, [f5]
+        BZ.H   h7, puts_done
+        PUTC.H h7
+        LDI.H  h8, 1
+        CVT.F  f6, h8
+        ADD.F  f5, f5, f6
+        BR     puts
+puts_done:
+        JMP    f20
+
+t_half:   TEXT "half, plain:       "
+          DATA.H 0
+t_float:  TEXT "float, plain:      "
+          DATA.H 0
+t_double: TEXT "double, plain:     "
+          DATA.H 0
+t_kahan:  TEXT "float, compensated: "
+          DATA.H 0

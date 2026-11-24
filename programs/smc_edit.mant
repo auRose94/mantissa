@@ -1,0 +1,22 @@
+; smc_edit.mant -- the loop's instruction is its own counter.
+;
+; The PUT instruction at 'tick' is the number 70000000 + 10000 * k: opcode
+; 70 (PUT), first operand k, which is register h(k).  Each pass the loop
+; reads that number, adds 10000 to move the register digit along, writes it
+; back, and only then runs it.
+        LDI.F  f5, tick
+        LDI.D  d1, 10000
+        LDI.D  d9, 70040000      ; stop once the instruction says h4
+        LDI.H  h1, 2
+        LDI.H  h2, 4
+        LDI.H  h3, 8
+        LDI.H  h4, 16
+loop:   LD.D   d0, [f5]          ; the instruction, as a number
+        BEQ.D  d0, d9, done
+        ADD.D  d0, d0, d1
+        ST.D   [f5], d0          ; rewrite it
+        PUT.D  d0                ; show what it is now ...
+        BR     tick
+tick:   PUT.H  h0                ; ... then run it: 70000000, 70010000, 70020000
+        BR     loop
+done:   HALT

@@ -1,0 +1,21 @@
+; ternary.mant -- a three-way branch: a binary search.
+;
+; BSGN jumps to its first target if the value is negative, to its second if
+; it is positive, and falls through if it is zero.  CMP hands it the sign of
+; a comparison, so one instruction settles "below, above or found".
+        LDI.F  f1, 7734          ; the number to find
+        LDI.F  f2, 0             ; the lowest it can be
+        LDI.F  f3, 10000         ; the highest it can be
+        LDI.F  f4, 2
+        LDI.F  f5, 1
+again:  ADD.F  f0, f2, f3
+        DIV.F  f0, f0, f4
+        CHOP.F f0, f0            ; the guess: halfway between
+        PUT.F  f0
+        CMP    f6, f1, f0        ; the number against the guess
+        BSGN   f6, lower, higher
+        HALT                    ; zero: found it
+lower:  SUB.F  f3, f0, f5        ; negative: it is below the guess
+        BR     again
+higher: ADD.F  f2, f0, f5        ; positive: it is above the guess
+        BR     again

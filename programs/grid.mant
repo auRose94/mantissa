@@ -1,0 +1,37 @@
+; grid.mant -- chop and round to a specific amount.
+;
+; CHOP, FLOOR, CEIL and ROUND take an optional third register: the step.
+; The result is a multiple of that step, worked out exactly and rounded
+; once.  For each pair below, the lines are: the number, the step, then what
+; chop, floor, ceil and round make of it.
+        LDI.D  d1, 2.675
+        LDI.D  d2, 0.01          ; to the nearest cent
+        JAL    f4, row
+        LDI.D  d1, 47
+        LDI.D  d2, 5
+        JAL    f4, row
+        LDI.D  d1, 47.5          ; a tie: round takes the even multiple
+        LDI.D  d2, 5
+        JAL    f4, row
+        LDI.D  d1, 42.5          ; the other kind of tie
+        LDI.D  d2, 5
+        JAL    f4, row
+        LDI.D  d1, -7.3
+        LDI.D  d2, 2
+        JAL    f4, row
+        HALT
+
+; row: print d1, d2, and the four roundings of d1 to multiples of d2.
+row:    PUT.D  d1
+        PUT.D  d2
+        CHOP   d3, d1, d2
+        PUT.D  d3
+        FLOOR  d3, d1, d2
+        PUT.D  d3
+        CEIL   d3, d1, d2
+        PUT.D  d3
+        ROUND  d3, d1, d2
+        PUT.D  d3
+        LDI.H  h0, 10
+        PUTC.H h0
+        JMP    f4

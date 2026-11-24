@@ -1,0 +1,13 @@
+; hello.mant -- text is half-precision code points, one per cell
+        LDI.F  f0, msg          ; f0 walks the string
+        LDI.H  h1, 1
+loop:   LD.H   h0, [f0]         ; h0 = *f0
+        BZ.H   h0, done         ; code point 0 ends the string
+        PUTC.H h0
+        CVT.F  f1, h1
+        ADD.F  f0, f0, f1       ; next cell: a half address is just a number
+        BR     loop
+done:   HALT
+
+msg:    TEXT   "Hello from a computer with no integers.\n"
+        DATA.H 0                ; the terminator
