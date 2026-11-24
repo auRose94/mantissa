@@ -1,16 +1,33 @@
 # Mantissa-1
 
-A fictional computer with no integers and no bytes, and a simulator for it.
-The name is a placeholder.
+[![CI](https://github.com/auRose94/mantissa/actions/workflows/ci.yml/badge.svg)](https://github.com/auRose94/mantissa/actions/workflows/ci.yml)
 
-Every value in memory is an IEEE 754 **half**, **float** or **double**.  There
-is nothing else to put in a register: no integers, no characters, no
-pointers.  Addresses are floats, the program counter is a float, a loop
-counter is a float, and so is every instruction.
+A computer with no integers and no bytes. Every value it can hold — data,
+addresses, loop counters, even its own instructions — is an IEEE 754 **half**,
+**float** or **double**, and nothing else. The same programs run on three
+implementations that agree line for line: a Python reference, a HIP GPU port,
+and an FPGA soft core.
+
+Every value in memory is a half, a float or a double. There is nothing else to
+put in a register: no integers, no characters, no pointers. Addresses are
+floats, the program counter is a float, a loop counter is a float, and so is
+every instruction.
 
 An instruction is a whole number, eight decimal digits long, stored as a
-double.  A program can read its own instructions, do arithmetic on them and
+double. A program can read its own instructions, do arithmetic on them and
 write them back.
+
+## Three implementations
+
+| implementation | what it is | speed | verified by |
+|---|---|---|---|
+| Python reference | `mantissa/`, this repository's core | ~350,000 instructions/s | exact-arithmetic tests, golden traces |
+| C++ host simulator | `gpu/build/mantissa-gpu sim` | ~61 million instructions/s | every golden trace, line for line |
+| HIP GPU fleet | up to 61,440 machines in one launch | ~1.7 billion instructions/s aggregate | co-simulation of every trace; Mantissa Dodge |
+| FPGA soft core | `fpga/`, a synthesizable SystemVerilog core | one lane per cycle through the FPU | every golden trace replayed; a 2,000-program fuzz |
+
+`PORTS.md` is the contract that makes this work: a trace format any
+implementation has to replay exactly, register write by register write.
 
 ## Try it
 
@@ -25,6 +42,16 @@ Needs Python 3.10 or newer and nothing else.  From this directory:
     python -m mantissa disasm programs/smc_edit.mant
     python programs/mandel_zoom.py
     python -m unittest discover -s tests -t .
+
+The compiler, for a small float-only language:
+
+    python3 compiler/m4c.py demo.m4 > demo.mant
+    python -m mantissa run demo.mant
+
+The ports:
+
+    bash gpu/test.sh     # HIP port: arithmetic differentials, every trace, the game
+    bash fpga/test.sh    # soft core: FPU vectors, every trace, Yosys, a fuzz run
 
 Program output goes to stdout, the simulator's remarks to stderr, so a program
 can be piped.  `--trace` shows each instruction before it runs, `--panel`
@@ -233,6 +260,10 @@ Mandelbrot program written for each type.  Out of 1,408 characters:
 | 0.000008 | 1,406 | 46 |
 | 0.0000002 | 1,293 | 426, float has collapsed into stripes |
 
+**A game.**  `gpu/` renders Mantissa Dodge entirely with the machine: one
+pixel machine per pixel casting rays and bouncing balls, a referee machine
+keeping score, the host only the console.  `gpu/python/run_game.py`.
+
 ## The simulator
 
 `mantissa/fp.py` holds the formats and the arithmetic, and everything in it is
@@ -256,6 +287,25 @@ The simulator runs about 350,000 instructions a second in CPython 3.14.
 a float.  That spelling belongs to the console, not to the machine: what a
 port must reproduce is the value.
 
+## The compiler
+
+`compiler/m4c.py` compiles a small float-only language — variables (doubles),
+`while`, `if`/`else`, `sqrt` and a few builtins, `print`, and arrays — to
+Mantissa assembly.  What it does beyond the obvious, each piece tested:
+
+- **Constant folding, but only what the machine computes exactly.**
+  `sqrt(4.0)` folds; `sqrt(2.0)` does not.
+- **Only the safe identities.**  `x*1` and `x-0` go; `x+0` stays, because it
+  turns −0 into +0.
+- **A literal pool keyed by bit pattern**, so −0.0 and 0.0 stay two literals.
+- **Dead-store removal** of a variable's never-read zero-init.
+- **Wall warnings**: a loop bound at or above half a counting wall is
+  reported, because `i = i + 1.0` stops moving there.
+
+`array a[16]` reserves sixteen doubles; `a[i]` compiles to an address
+computation and one load or store.  There are no bounds checks: out of range
+is an address fault, which is what the machine does to everybody.
+
 ## Decisions still open
 
 - **Flags**: visible on the panel only.  A program could be allowed to test
@@ -263,19 +313,22 @@ port must reproduce is the value.
 - **Literals**: rounded silently.  The assembler could refuse a literal its
   type cannot hold.
 - **Memory protection**: none.  Code could be write-protected, at a price.
-- **No transcendental instructions, no input, no traps, no compiler.**
+- **No transcendental instructions, no input, no traps.**
 
 ## Layout
 
     mantissa/   fp, isa, memory, machine, asm, disasm, trace, and the command line
     programs/   the demos, and the Mandelbrot zoom tour
     compiler/   m4c.py: a compiler for a small float-only language, arrays included
-    gpu/        the HIP port: cosim, sim (60M instructions a second on the host),
-                array mode, and Mantissa Dodge
-    fpga/       the soft core: Verilator-verified, Yosys-elaborated, fuzzed
+    gpu/        the HIP port: co-simulation, the host simulator (61M instructions
+                a second), array mode, SIMD, and Mantissa Dodge
+    fpga/       the soft core: every golden trace replayed, vector instructions
+                included, Yosys cell counts, and a program fuzzer
     tests/      the arithmetic against exact arithmetic, then everything else
     golden/     recorded runs for other implementations to replay; see PORTS.md
-    EXTENSIONS.md  SIMD, a screen device, optimisation patterns, and the road
+    PORTS.md    the trace contract the three implementations share
+    EXTENSIONS.md  SIMD's design and its measured verdict, a screen device,
+                optimisation patterns, and the road
 
 The name is Mantissa.  It stuck.
 
