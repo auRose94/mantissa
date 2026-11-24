@@ -32,7 +32,7 @@ How it compiles: the machine's arithmetic is three-address, so an expression
 evaluates onto a stack of temporary registers and a variable's own register is
 returned directly, never copied -- but every register is tracked as owned (a
 temporary) or borrowed (a variable), and only owned ones go back to the free
-list.  Control flow is BZ and BR over labels.  Three optimisations run before
+list.  Control flow is BZ and BR over labels.  Four optimisations run before
 codegen, each one tested in tests/test_compiler.py:
 
     folding      an expression of only literals becomes the literal the
