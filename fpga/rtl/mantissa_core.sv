@@ -68,15 +68,23 @@ module mantissa_core
   output logic [1:0]               ev_end,            // mantissa_pkg::EV_*
   output logic [1:0]              ev_fault,          // mantissa_pkg::fault_e
   output logic [63:0]              ev_pc,             // the pc the step began at
-  output logic [1:0]               ev_nwr,            // 0, 1 or 2 registers written
+  output logic [2:0]               ev_nwr,            // 0 to 4 registers written
   output logic [6:0]               ev_wcode0,         // the first register written, 0..95
-  output logic [6:0]               ev_wcode1,         // and the second, when there is one
+  output logic [6:0]               ev_wcode1,         // and the others, when there are ones
+  output logic [6:0]               ev_wcode2,
+  output logic [6:0]               ev_wcode3,
   output logic [63:0]              ev_wval0,          // the values written
   output logic [63:0]              ev_wval1,
+  output logic [63:0]              ev_wval2,
+  output logic [63:0]              ev_wval3,
   output logic [1:0]               ev_wprov0,         // where a written NaN came from (mantissa_pkg::PROV_*)
   output logic [1:0]               ev_wprov1,
+  output logic [1:0]               ev_wprov2,
+  output logic [1:0]               ev_wprov3,
   output logic [6:0]               ev_wsrc0,          // for an inherited NaN: the register it came from
   output logic [6:0]               ev_wsrc1,
+  output logic [6:0]               ev_wsrc2,
+  output logic [6:0]               ev_wsrc3,
   output logic                     ev_store,
   output logic [AW-1:0]            ev_saddr,          // cell address
   output logic [1:0]               ev_sfmt,           // the format stored: 1, 2 or 4 cells
@@ -105,16 +113,25 @@ module mantissa_core
   // what kind of instruction it is
   typedef enum logic [3:0] {
     C_ILLEGAL = 4'd0, C_NOP, C_HALT, C_ALU, C_ST, C_LDI, C_LD, C_BR, C_JMP, C_JAL,
-    C_BSGN, C_BZ, C_BCMP, C_PUT, C_PUTC
+    C_BSGN, C_BZ, C_BCMP, C_PUT, C_PUTC, C_VEC
   } cls_e;
 
   // what to do when the FPU answers
-  localparam logic [1:0] RET_ALU = 2'd0, RET_ST = 2'd1, RET_BRANCH = 2'd2;
+  localparam logic [1:0] RET_ALU = 2'd0, RET_ST = 2'd1, RET_BRANCH = 2'd2, RET_VEC = 2'd3;
   // what mem_rdata is in ST_OPND
   localparam logic [1:0] O_LDI = 2'd0, O_LD = 2'd1, O_TARGET = 2'd2, O_JAL = 2'd3;
 
   // opcode numbers
   localparam logic [6:0] OP_CVT   = 7'd14, OP_SPLIT = 7'd15, OP_JOIN  = 7'd16;
+  localparam logic [6:0] OP_VADD2 = 7'd72, OP_VSUB2 = 7'd73, OP_VMUL2 = 7'd74;
+  localparam logic [6:0] OP_VDIV2 = 7'd75, OP_VFMA2 = 7'd76, OP_VMIN2 = 7'd77, OP_VMAX2 = 7'd78;
+  localparam logic [6:0] OP_VADD4 = 7'd79, OP_VSUB4 = 7'd80, OP_VMUL4 = 7'd81;
+  localparam logic [6:0] OP_VDIV4 = 7'd82, OP_VFMA4 = 7'd83, OP_VMIN4 = 7'd84, OP_VMAX4 = 7'd85;
+
+  // the vector instructions work on 2 or 4 consecutive registers of one file
+  function automatic logic [2:0] lanes_of(input logic [6:0] op);
+        lanes_of = (op >= OP_VADD4) ? 3'd4 : 3'd2;
+  endfunction
   localparam logic [6:0] OP_BSGN  = 7'd61, OP_BEQ   = 7'd62, OP_BNE   = 7'd63;
   localparam logic [6:0] OP_BLT   = 7'd64, OP_BLE   = 7'd65, OP_BZ    = 7'd66, OP_BNZ = 7'd67;
 
@@ -130,7 +147,11 @@ module mantissa_core
 
   // the decode of the current instruction, kept while the FPU or memory works
   logic [6:0]        r_op;
-  logic [6:0]        r_a, r_b;             // destination register codes
+  logic [6:0]        r_a, r_b, r_c;        // register codes: the destination and the two sources
+  logic [5:0]        r_fop;                // the scalar FPU op a vector lane runs
+  logic [1:0]        r_lane;               // which lane of a vector instruction is next
+  logic [6:0]        v_code [0:3];         // the registers a vector instruction wrote
+  logic [63:0]       v_val  [0:3];         // and the values, held for the event
   logic [1:0]        r_ret;                // RET_*
   logic [3:0]        r_skip;               // cells the instruction takes when it falls through
   logic [1:0]        r_oret;               // O_*
@@ -336,8 +357,32 @@ module mantissa_core
       7'd69:  begin d_cls = C_JMP;  d_use = 3'b001; end
       7'd70:  begin d_cls = C_PUT;  d_use = 3'b001; end
       7'd71:  begin d_cls = C_PUTC; d_use = 3'b001; end
+      OP_VADD2: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_ADD; end
+      OP_VSUB2: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_SUB; end
+      OP_VMUL2: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_MUL; end
+      OP_VDIV2: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_DIV; end
+      OP_VFMA2: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_FMA; end
+      OP_VMIN2: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_MIN; end
+      OP_VMAX2: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_MAX; end
+      OP_VADD4: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_ADD; end
+      OP_VSUB4: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_SUB; end
+      OP_VMUL4: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_MUL; end
+      OP_VDIV4: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_DIV; end
+      OP_VFMA4: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_FMA; end
+      OP_VMIN4: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_MIN; end
+      OP_VMAX4: begin d_cls = C_VEC; d_use = 3'b111; d_same = 1'b1; d_fop = mantissa_pkg::F_MAX; end
       default: d_cls = C_ILLEGAL;
     endcase
+  end
+
+  // the vector instructions work on 2 or 4 consecutive registers of one file
+  logic [2:0]  d_lanes;
+  logic [6:0]  g_a, g_b, g_c;
+  always_comb begin
+    d_lanes = (d_op >= OP_VADD4) ? 3'd4 : 3'd2;
+    g_a = {2'b00, d_a[4:0]} + {4'd0, d_lanes};
+    g_b = {2'b00, d_b[4:0]} + {4'd0, d_lanes};
+    g_c = {2'b00, d_c[4:0]} + {4'd0, d_lanes};
   end
 
   // A field the instruction does not use must be 00; one it uses must name a
@@ -365,6 +410,11 @@ module mantissa_core
         else if (d_op == OP_CVT)                        d_types = (fa != fb);
         else if (d_op == OP_SPLIT)                      d_types = (fa == fb);
         else if (d_op == OP_JOIN)                       d_types = (fb == fc);
+      end
+      C_VEC: begin
+        // one file for all three groups, and no group runs past register 31
+        d_types = (fa == fb) && (fb == fc)
+                  && (g_a <= 7'd32) && (g_b <= 7'd32) && (g_c <= 7'd32);
       end
       C_LD:                                            d_types = (fb == mantissa_pkg::FMT_F);
       C_ST:                                            d_types = (fa == mantissa_pkg::FMT_F);
@@ -494,6 +544,10 @@ module mantissa_core
         if (fpu_done && (r_ret == RET_ALU)) begin
           adv_now = 1'b1;
           adv_k = r_skip;                         // 8 for LDI, 4 for the rest
+        end else if (fpu_done && (r_ret == RET_VEC)
+                     && (r_lane == lanes_of(r_op) - 1)) begin
+          adv_now = 1'b1;
+          adv_k = r_skip;                         // the last lane has been written
         end else if (fpu_done && (r_ret == RET_BRANCH) && !taken) begin
           adv_now = 1'b1;
           adv_k = r_skip;                         // past the operand, or both of BSGN's
@@ -517,7 +571,10 @@ module mantissa_core
                  || (d_cls == C_PUTC) || (d_cls == C_JMP)) retire_now = 1'b1;
       end
       ST_FPU: begin
-        if (fpu_done) retire_now = (r_ret == RET_ALU) || ((r_ret == RET_BRANCH) && !taken);
+        if (fpu_done) begin
+          if (r_ret == RET_VEC) retire_now = (r_lane == lanes_of(r_op) - 1);
+          else retire_now = (r_ret == RET_ALU) || ((r_ret == RET_BRANCH) && !taken);
+        end
       end
       ST_OPND:  retire_now = (r_oret == O_TARGET) || (r_oret == O_JAL);
       ST_POST:  retire_now = 1'b1;
@@ -629,10 +686,10 @@ module mantissa_core
     fpu_c = 64'd0;
     case (state)
       ST_DECODE: begin
-        if (dec_go) fpu_start = (d_cls == C_ALU) || (d_cls == C_ST) || (d_cls == C_BSGN)
-                               || (d_cls == C_BZ) || (d_cls == C_BCMP);
+        if (dec_go) fpu_start = (d_cls == C_ALU) || (d_cls == C_VEC) || (d_cls == C_ST)
+                               || (d_cls == C_BSGN) || (d_cls == C_BZ) || (d_cls == C_BCMP);
         case (d_cls)
-          C_ALU: begin
+          C_ALU, C_VEC: begin
             fpu_op = d_fop;
             fpu_a = ((d_fop == mantissa_pkg::F_SPLIT) || (d_fop == mantissa_pkg::F_MANT)) ? rc : rb;
             fpu_b = rc;
@@ -667,6 +724,18 @@ module mantissa_core
           end
           default: ;
         endcase
+      end
+      ST_FPU: begin
+        // a vector instruction restarts its FPU call per lane, on the cycle
+        // the previous lane completes
+        if ((r_ret == RET_VEC) && fpu_done && (r_lane != lanes_of(r_op) - 1)) begin
+          fpu_start = 1'b1;
+          fpu_op   = r_fop;
+          fpu_fmt  = r_fmt;
+          fpu_a    = regs[r_b + r_lane + 1];
+          fpu_b    = regs[r_c + r_lane + 1];
+          fpu_c    = regs[r_a + r_lane + 1];   // FMA's addend is its own destination
+        end
       end
       ST_OPND: begin
         fpu_start = (r_oret == O_LDI) || (r_oret == O_LD);
@@ -718,15 +787,23 @@ module mantissa_core
       ev_end <= mantissa_pkg::EV_RETIRE;
       ev_fault <= mantissa_pkg::FAULT_ADDRESS;
       ev_pc <= 64'd0;
-      ev_nwr <= 2'd0;
+      ev_nwr <= 3'd0;
       ev_wcode0 <= 7'd0;
       ev_wcode1 <= 7'd0;
+      ev_wcode2 <= 7'd0;
+      ev_wcode3 <= 7'd0;
       ev_wval0 <= 64'd0;
       ev_wval1 <= 64'd0;
+      ev_wval2 <= 64'd0;
+      ev_wval3 <= 64'd0;
       ev_wprov0 <= 2'd0;
       ev_wprov1 <= 2'd0;
+      ev_wprov2 <= 2'd0;
+      ev_wprov3 <= 2'd0;
       ev_wsrc0 <= 7'd0;
       ev_wsrc1 <= 7'd0;
+      ev_wsrc2 <= 7'd0;
+      ev_wsrc3 <= 7'd0;
       ev_store <= 1'b0;
       ev_saddr <= {AW{1'b0}};
       ev_sfmt <= 2'd0;
@@ -741,15 +818,23 @@ module mantissa_core
       ev_end <= mantissa_pkg::EV_RETIRE;
       ev_fault <= mantissa_pkg::FAULT_ADDRESS;
       ev_pc <= pc;
-      ev_nwr <= 2'd0;
+      ev_nwr <= 3'd0;
       ev_wcode0 <= 7'd0;
       ev_wcode1 <= 7'd0;
+      ev_wcode2 <= 7'd0;
+      ev_wcode3 <= 7'd0;
       ev_wval0 <= 64'd0;
       ev_wval1 <= 64'd0;
+      ev_wval2 <= 64'd0;
+      ev_wval3 <= 64'd0;
       ev_wprov0 <= 2'd0;
       ev_wprov1 <= 2'd0;
+      ev_wprov2 <= 2'd0;
+      ev_wprov3 <= 2'd0;
       ev_wsrc0 <= 7'd0;
       ev_wsrc1 <= 7'd0;
+      ev_wsrc2 <= 7'd0;
+      ev_wsrc3 <= 7'd0;
       ev_store <= 1'b0;
       ev_saddr <= {AW{1'b0}};
       ev_sfmt <= 2'd0;
@@ -781,6 +866,10 @@ module mantissa_core
         end
 
         ST_DECODE: begin
+`ifdef M1_VEC_DEBUG
+          $display("[vec] t=%0t DEC dec_go=%b cls=%0d op=%0d ok=%b types=%b",
+                   $time, dec_go, d_cls, d_op, d_ok, d_types);
+`endif
           if (limit_hit) state <= ST_LIMIT;
           else if (!dec_go) begin
             // not an instruction, or operands that break a type rule, or an
@@ -814,13 +903,16 @@ module mantissa_core
 
               C_JMP: step_count <= step_count + 32'd1;      // the tail takes the target
 
-              C_ALU: begin
-                r_ret <= RET_ALU;
+              C_ALU, C_VEC: begin
+                r_ret <= (d_cls == C_VEC) ? RET_VEC : RET_ALU;
                 r_skip <= d_skip;
                 r_op <= d_op;
                 r_a <= d_ra;
                 r_b <= d_rb;
+                r_c <= d_rc;
                 r_fmt <= fa;
+                r_fop <= d_fop;
+                r_lane <= 2'd0;
                 r_wb2 <= (d_fop == mantissa_pkg::F_SPLIT) || (d_fop == mantissa_pkg::F_MANT);
                 r_setflags <= 1'b1;
                 // MOV passes a NaN on, and SPLIT passes x on when x is a NaN;
@@ -898,13 +990,53 @@ module mantissa_core
         end
 
         ST_FPU: begin
+`ifdef M1_VEC_DEBUG
+          $display("[vec] t=%0t FPU ret=%0d done=%b lane=%0d start=%b fop=%0d evv=%b nwr=%0d c=%0d/%0d/%0d/%0d",
+                   $time, r_ret, fpu_done, r_lane, fpu_start, fpu_op,
+                   ev_valid, ev_nwr, ev_wcode0, ev_wcode1, ev_wcode2, ev_wcode3);
+`endif
           if (fpu_done) begin
             case (r_ret)
+              RET_VEC: begin
+                // one lane per FPU call; the write is arithmetic, so its NaN
+                // provenance is always the canonical one
+                regs[r_a + r_lane] <= fpu_y;
+                if (r_setflags) flags <= flags | fpu_flags;
+                v_code[r_lane] <= r_a + r_lane;
+                v_val[r_lane] <= fpu_y;
+                if (r_lane == lanes_of(r_op) - 1) begin
+                  ev_nwr <= {1'b0, lanes_of(r_op)};
+                  ev_wcode0 <= v_code[0];
+                  ev_wval0 <= v_val[0];
+                  // the earlier lanes were held as they completed; the last lane
+                  // completes this very cycle, so it reads its sources instead
+                  // of the holding register it is about to overwrite
+                  if (lanes_of(r_op) == 3'd4) begin
+                    ev_wcode1 <= v_code[1];
+                    ev_wcode2 <= v_code[2];
+                    ev_wval1 <= v_val[1];
+                    ev_wval2 <= v_val[2];
+                    ev_wcode3 <= r_a + r_lane;
+                    ev_wval3 <= fpu_y;
+                  end else begin
+                    ev_wcode1 <= r_a + r_lane;
+                    ev_wval1 <= fpu_y;
+                  end
+                  ev_wprov0 <= mantissa_pkg::PROV_CANON;
+                  ev_wprov1 <= mantissa_pkg::PROV_CANON;
+                  ev_wprov2 <= mantissa_pkg::PROV_CANON;
+                  ev_wprov3 <= mantissa_pkg::PROV_CANON;
+                  step_count <= step_count + 32'd1;
+                end else begin
+                  r_lane <= r_lane + 2'd1;
+                  state <= ST_FPU;               // the restart pulses in the mux
+                end
+              end
               RET_ALU: begin
                 regs[r_a] <= fpu_y;
                 if (r_wb2) regs[r_b] <= fpu_y2;
                 if (r_setflags) flags <= flags | fpu_flags;
-                ev_nwr <= r_wb2 ? 2'd2 : 2'd1;
+                ev_nwr <= r_wb2 ? 3'd2 : 3'd1;
                 ev_wcode0 <= r_a;
                 ev_wcode1 <= r_b;
                 ev_wval0 <= fpu_y;

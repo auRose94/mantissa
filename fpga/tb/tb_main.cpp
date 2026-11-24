@@ -267,12 +267,12 @@ int run_one(const std::string& in_path, const Options& opt) {
 
       // register writes: the new tags come from the state before the step
       const int nwr = dut->ev_nwr;
-      int code[2] = {dut->ev_wcode0, dut->ev_wcode1};
-      uint64_t val[2] = {dut->ev_wval0, dut->ev_wval1};
-      int prov[2] = {dut->ev_wprov0, dut->ev_wprov1};
-      int src[2] = {dut->ev_wsrc0, dut->ev_wsrc1};
+      int code[4] = {dut->ev_wcode0, dut->ev_wcode1, dut->ev_wcode2, dut->ev_wcode3};
+      uint64_t val[4] = {dut->ev_wval0, dut->ev_wval1, dut->ev_wval2, dut->ev_wval3};
+      int prov[4] = {dut->ev_wprov0, dut->ev_wprov1, dut->ev_wprov2, dut->ev_wprov3};
+      int src[4] = {dut->ev_wsrc0, dut->ev_wsrc1, dut->ev_wsrc2, dut->ev_wsrc3};
       int tag[2] = {0, 0};
-      for (int i = 0; i < nwr && i < 2; i++) {
+      for (int i = 0; i < nwr && i < 4; i++) {
         if (code[i] >= NREGS) { std::fprintf(stderr, "m1_sim: bad register code %d\n", code[i]); return 1; }
         if (!is_nan_bits(val[i])) continue;
         if (prov[i] == PROV_INHERIT) {
@@ -289,7 +289,7 @@ int run_one(const std::string& in_path, const Options& opt) {
       }
       RegState before[NREGS];
       bool touched[NREGS] = {};
-      for (int i = 0; i < nwr && i < 2; i++) {
+      for (int i = 0; i < nwr && i < 4; i++) {
         if (!touched[code[i]]) {
           touched[code[i]] = true;
           before[code[i]] = shadow[code[i]];

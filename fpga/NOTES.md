@@ -162,28 +162,28 @@ is now covered by the fuzzer: the machine has the number of cells the header
 says, not the number the build provides, so a trace recorded with 1,000 cells
 must fault for address 1,000.
 
-## The vector instructions are not on the core yet
+## The vector instructions
 
-The ISA grew fourteen vector instructions (opcodes 72 to 85: VADD, VSUB,
-VMUL, VDIV, VFMA, VMIN and VMAX over 2 or 4 consecutive registers; see
-EXTENSIONS.md).  The reference, the HIP port and `golden/simd.trace` have
-them; the core does not, so `test.sh` replays every golden trace except
-`simd.trace` until it does.  The design, worked out against this core:
+Built: opcodes 72 to 85 (VADD, VSUB, VMUL, VDIV, VFMA, VMIN and VMAX over 2
+or 4 consecutive registers; see EXTENSIONS.md) run on the core, lane by lane
+through the FPU, and `golden/simd.trace` replays with the rest.  Four things
+came up on the way:
 
-- **The event capture holds two register writes a step** (`ev_nwr`,
-  `ev_wcode0/1`, `ev_wval0/1`, `ev_wprov0/1`, `ev_wsrc0/1`), and a VADD4
-  writes four registers.  The capture needs four slots (or the testbench
-  needs to accept several events a step), in the RTL and in `tb/tb_main.cpp`.
-- **The execution needs a lane loop.**  The ALU path starts its FPU request
-  at ST_DECODE and writes at ST_FPU; a vector op repeats that per lane: a
-  `r_lane` counter, the FPU restarted per lane with the operands
-  `regs[r_b + r_lane]`, `regs[r_c + r_lane]` and the accumulator
-  `regs[r_a + r_lane]`, a write per lane with CANON provenance, and the step
-  retires on the last lane.  The FPU op itself is unchanged -- the vector
-  instructions are their scalar instructions, lane by lane.
-- **Decode**: opcodes 72 to 85 are three-register, same-file, with a group
-  check (`(code & 31) + lanes <= 32` for all three fields, else
-  illegal-instruction), and lanes = 2 below opcode 79, 4 from it.
-- The fuzzer (`tools/fuzz_programs.py`) generates from `mantissa.isa`, so it
-  picks the vector instructions up by itself and will exercise them the
-  moment the core has them.
+- **the event capture grew to four register writes a step** (a VADD4 writes
+  four), with the values held in their own registers and copied to the event
+  on the last lane, so the event pulse still carries the whole step;
+- **the last lane is its own exception**: it completes the very cycle the
+  event is built, so its slot reads the sources (`r_a + r_lane`, `fpu_y`)
+  instead of the holding register it is writing that same edge.  Reading the
+  holding register emitted the previous vector instruction's last lane.
+- **the lane count needs its width**: `lanes_of` first returned two bits, so
+  a four-lane op wrapped to zero, and in `r_lane == lanes_of - 1` the unsized
+  literal widened the expression to 32 bits -- `0 - 1` is not `3` there.  The
+  core spun inside the first VADD4 forever; a three-bit return fixed every
+  use site at once.
+- **the predicate ordering** that bit the GPU kernel (the distance must be
+  read before the lanes are updated -- see EXTENSIONS.md) applies here too,
+  but the core escaped it: each lane's FPU call runs while every register
+  still holds its pre-instruction value.
+
+The fuzzer exercises the vector instructions along with everything else.
