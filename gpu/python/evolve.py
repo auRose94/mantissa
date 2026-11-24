@@ -2,7 +2,7 @@
 
     python3 evolve.py --demo                    # the fleet, if gpu/build/mantissa-gpu exists
     python3 evolve.py --demo --cpu              # the same loop on the reference simulator
-    python3 evolve.py --demo --population 128 --generations 600 --seed 7
+    python3 evolve.py --demo --population 256 --generations 900 --seed 6
 
 The task, stated precisely: the skeleton below is a case loop.  Per machine it
 reads `--cases` inputs x (patched doubles at `cases`), runs each through the
@@ -19,7 +19,10 @@ The population rides to the fleet as the patch block of one array job: one
 candidate is one machine, its genome IS its input patches, and a generation
 is one `mantissa-gpu array` run over the whole population.  The host scores,
 keeps the elites, mutates children of tournament winners, adds a few fresh
-random bodies, and sends the next generation as a new job.
+random bodies, and sends the next generation as a new job.  If nothing
+improves for `--restart` generations, the bottom of the population is
+redrawn -- selection has collapsed onto one stuck elite by then, and the
+fleet makes fresh bodies cheaper than the patience to wait for them.
 
 Mutation is the SMC arithmetic of programs/smc_edit.mant, done on the host:
 
@@ -43,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import math
 import os
 import random
 import re
@@ -69,9 +73,22 @@ def target(x):
     return x * x + x
 
 
+ERROR_CAP = 1e100  # clamped errors square to 1e200: finite, and ranking enough
+
+
 def sse(outputs, cases):
-    """Sum of squared error of the machine's outputs against target() over the cases."""
-    return sum((out - target(x)) ** 2 for out, x in zip(outputs, cases))
+    """Sum of squared error of the machine's outputs against target() over the
+    cases.  A body can output anything -- a garbage double, an infinity, a
+    NaN -- and the host still owes the fleet a ranking, so each error is
+    clamped into [-ERROR_CAP, ERROR_CAP] first; without that, squaring an
+    overflowing double raises on the host."""
+    total = 0.0
+    for out, x in zip(outputs, cases):
+        e = out - target(x)
+        if not -ERROR_CAP <= e <= ERROR_CAP:  # also false for NaN
+            e = math.copysign(ERROR_CAP, e) if e == e else ERROR_CAP
+        total += e * e
+    return total
 
 
 # --- mutation as arithmetic -------------------------------------------------------------
@@ -184,6 +201,7 @@ def seeded_body(slots):
     so a small population has a graded hill to descend and the search proper
     has something to do from its first generation.  The demo starts random;
     this is for small runs and for tests."""
+    slots = max(slots, 2)
     return [float(isa.encode(22, 68, 64, 64)),    # MUL.D  d4, d0, d0
             float(isa.encode(20, 68, 68, 65)),    # ADD.D  d4, d4, d1
             *([float(isa.encode(1, 0, 0, 0))] * (slots - 2))]
@@ -228,9 +246,9 @@ def next_generation(population, scores, rng, elite, immigrants):
 # --- the skeleton and its layout --------------------------------------------------------
 
 # One shared image; a machine's body and its cases arrive as patches.  The
-# loop keeps d1 = 1.0 and d2 = 2.0 on hand (re-loaded each pass, so the body
-# may clobber them), reads x into d0, and stores d4.  Everything between is
-# the evolved body.
+# loop keeps small constants on hand in d1 = 1.0, d2 = 2.0 and d3 = 0.25
+# (re-loaded each pass, so the body may clobber them), reads x into d0, and
+# stores d4.  Everything between is the evolved body.
 def _template(ncases, slots):
     lines = ["        LDI.F  f5, cases",
              "        LDI.F  f6, outs",
@@ -239,7 +257,8 @@ def _template(ncases, slots):
              "        LDI.H  h2, 1",
              "loop:   LD.D   d0, [f5]",
              "        LDI.D  d1, 1",
-             "        LDI.D  d2, 2"]
+             "        LDI.D  d2, 2",
+             "        LDI.D  d3, 0.25"]
     lines += [f"slot{k}:  DATA.D 0" for k in range(1, slots + 1)]
     lines += ["        ST.D   [f6], d4",
               "        ADD.F  f5, f5, f7",
@@ -261,7 +280,7 @@ class Layout:
         self.cases = int(image.symbols["cases"])
         self.outs = int(image.symbols["outs"])
         self.memory = max(256, (self.outs + 4 * ncases + 15) // 16 * 16)
-        self.max_steps = ncases * (12 + slots) + 64
+        self.max_steps = ncases * (13 + slots) + 64
 
 
 def write_double(mem, addr, value):
@@ -374,21 +393,39 @@ def find_binary(path):
 
 # --- the loop ---------------------------------------------------------------------------
 
-def search(evaluate, population, rng, generations, elite, immigrants, threshold, report):
+def search(evaluate, population, rng, generations, elite, immigrants, threshold, report, restart=75):
     """The generational loop.  Returns (body, score, generation, converged):
     the champion as last evaluated, which generation it was found, and
-    whether the threshold was met before the generation budget ran out."""
+    whether the threshold was met before the generation budget ran out.
+
+    On a stall -- `restart` generations without an improvement -- the bottom
+    of the population is redrawn and the top `elite` ride over.  Selection
+    has collapsed onto one stuck elite by then, and cloning the champion
+    alone would also wipe the near-champion cloud the population has
+    accumulated -- often the part that holds the last mile -- so the redraw
+    keeps the top as they are and replaces the rest with fresh bodies."""
     champion, best_score, found = population[0], float("inf"), 0
+    stalled = 0
     for generation in range(generations):
         scores, info = evaluate(population)
         order = sorted(range(len(population)), key=lambda i: scores[i])
         best, mean = scores[order[0]], sum(scores) / len(scores)
         if best < best_score:
             champion, best_score, found = population[order[0]], best, generation
+            stalled = 0
+        else:
+            stalled += 1
         report(generation, best, mean, population[order[0]], info)
         if best <= threshold:
             return champion, best_score, generation, True
-        population = next_generation(population, scores, rng, elite, immigrants)
+        if restart and stalled >= restart:
+            keep = min(elite, len(population))
+            population = ([[*population[i]] for i in order[:keep]]
+                          + [random_body(rng, len(champion)) for _ in range(len(population) - keep)])
+            stalled = 0
+            report(generation, best, mean, champion, {**info, "restart": True})
+        else:
+            population = next_generation(population, scores, rng, elite, immigrants)
     return champion, best_score, found, False
 
 
@@ -419,7 +456,8 @@ def disasm_program(layout, body):
 
 # --- the demo ---------------------------------------------------------------------------
 
-CASES = (-1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5)  # exact halves: targets are exact too
+CASES = (-1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5,
+         5.75, 6.0, 6.25, 6.5, 6.75, 7.0, 7.25, 7.5)  # exact quarters: targets are exact too
 
 
 def demo(args):
@@ -457,12 +495,14 @@ def demo(args):
             marks.append(f"{info['faulted']} faulted")
         if info["limited"]:
             marks.append(f"{info['limited']} at the limit")
+        if info.get("restart"):
+            marks.append("redrawn around the champion")
         note = f" [{', '.join(marks)}]" if marks else ""
         if best < seen[0]:
             seen[0] = best
             listing = " | ".join(disasm_word(w) for w in body)
             print(f"gen {generation:4d}: best {best:.6g}  mean {mean:.6g}{note}  {listing}")
-        elif generation % 25 == 0:
+        elif generation % 25 == 0 or info.get("restart"):
             print(f"gen {generation:4d}: best {best:.6g}  mean {mean:.6g}{note}")
 
     print(f"evolve: target {TARGET_TEXT} over the cases {list(cases)}")
@@ -475,8 +515,9 @@ def demo(args):
     began = time.time()
     champion, score, found, converged = search(
         evaluate, [random_body(rng, args.slots) for _ in range(args.population)], rng,
-        args.generations, args.elite, args.immigrants, args.threshold, report)
+        args.generations, args.elite, args.immigrants, args.threshold, report, args.restart)
     wall = time.time() - began
+    generations_ran = len(walls)  # the cross-check below evaluates once more; keep it out of the timing
 
     print()
     print(disasm_program(layout, champion))
@@ -504,9 +545,9 @@ def demo(args):
         print(f"  x = {x:5g}   out {out!r:24}   want {want!r}")
     print(f"{exact} of {len(cases)} outputs exact")
 
-    per_gen = wall / max(1, len(walls))
-    print(f"fleet: {len(walls)} generations in {wall:.1f} s, {per_gen * 1000:.0f} ms a generation",
-          end="")
+    per_gen = wall / max(1, generations_ran)
+    print(f"{('fleet' if gpu else 'reference')}: {generations_ran} generations in {wall:.1f} s, "
+          f"{per_gen * 1000:.0f} ms a generation", end="")
     if kernels:
         print(f" (kernel {sum(kernels) / len(kernels):.2f} ms)", end="")
     print()
@@ -518,19 +559,27 @@ def main():
     parser.add_argument("--demo", action="store_true", help="run the evolution demo")
     parser.add_argument("--cpu", action="store_true", help="evaluate on the reference simulator")
     parser.add_argument("--gpu", default="gpu/build/mantissa-gpu", help="path of the GPU binary")
-    parser.add_argument("--population", type=int, default=128)
-    parser.add_argument("--generations", type=int, default=600)
+    parser.add_argument("--population", type=int, default=256)
+    parser.add_argument("--generations", type=int, default=900)
     parser.add_argument("--cases", type=int, default=8)
     parser.add_argument("--slots", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--seed", type=int, default=6)
     parser.add_argument("--threshold", type=float, default=1e-9)
-    parser.add_argument("--elite", type=int, default=12)
-    parser.add_argument("--immigrants", type=int, default=8)
+    parser.add_argument("--elite", type=int, default=16)
+    parser.add_argument("--immigrants", type=int, default=12)
     parser.add_argument("--max-steps", type=int, default=0, help="0 = sized from the cases and slots")
+    parser.add_argument("--restart", type=int, default=75,
+                        help="generations without improvement before the population is redrawn; 0 disables")
     args = parser.parse_args()
     if not args.demo:
         parser.print_help()
         return 2
+    if not 2 <= args.cases <= len(CASES):
+        parser.error(f"--cases must be between 2 and {len(CASES)}")
+    if not 2 <= args.slots <= 8:
+        parser.error("--slots must be between 2 and 8")
+    if args.elite + args.immigrants >= args.population:
+        parser.error("the population must exceed elites plus immigrants")
     return demo(args)
 
 

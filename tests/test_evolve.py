@@ -121,6 +121,18 @@ class TestFitness(unittest.TestCase):
         self.assertEqual(evolve.sse([0.0] * len(self.CASES), self.CASES),
                          0.75 ** 2 + 0.25 ** 2 + 0.75 ** 2 + 3.75 ** 2 + 8.75 ** 2 + 15.75 ** 2)
 
+    def test_sse_survives_garbage_outputs(self):
+        # a body can output anything; the fitness still owes the host a finite
+        # ranking, and garbage must not score better than merely wrong
+        cases = (1.0, 2.0)
+        garbage = evolve.sse([float("inf"), float("nan")], cases)
+        wild = evolve.sse([1e308, -1e308], cases)
+        wrong = evolve.sse([4.0, 6.0], cases)
+        self.assertTrue(garbage == garbage and garbage < float("inf"))
+        self.assertTrue(wild == wild and wild < float("inf"))
+        self.assertGreater(garbage, wrong)
+        self.assertGreaterEqual(wild, wrong)
+
     def test_known_body_is_perfect_on_the_reference(self):
         layout = evolve.Layout(len(self.CASES), 4)
         body = [word(22, 68, 64, 64),   # MUL.D  d4, d0, d0

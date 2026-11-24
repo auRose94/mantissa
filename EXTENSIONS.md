@@ -121,6 +121,61 @@ The road from here, in order of value:
 4. **Vector intrinsics**: when SIMD lands, `vadd(a, b)` maps one source line
    to one `VADD4`.
 
+## The search: evolution over programs on the fleet
+
+The first extrapolation of the section below is now built, host-driven:
+`gpu/python/evolve.py` evolves Mantissa-1 programs, the population is the
+array fleet, and one generation is one `mantissa-gpu array` run.
+
+The task: a fixed skeleton reads a case's x into d0, passes it through four
+evolved instruction slots, and stores d4, looping over the cases patched
+into the machine.  A candidate is four whole instruction numbers, one
+d0 -> d4 function, and fitness is the sum of squared error of the picks
+against the reference's exact answer for x^2 + x.  One candidate is one
+machine; the population rides to the fleet as the job's patch block, so the
+genome *is* the machine's input patches.  The host scores, keeps the
+elites, and sends mutated children plus a few fresh random bodies as the
+next generation's patches.
+
+Mutation is the SMC arithmetic of `smc_edit.mant`, done on the host:
+`+1000000*k` retargets the opcode, `+10000*k` the first operand field,
+`+100*k` the second, `+k` the third.  Every edit must still decode
+(`mantissa.isa.decode`) and stay four cells, or it is redrawn.  The ISA's
+decimal layout does half the work: the arithmetic opcodes are consecutive
+(20 ADD, 21 SUB, 22 MUL) and neighbouring registers have neighbouring codes
+(d0 is 64, d1 is 65), so small arithmetic walks the ISA semantically.
+
+**The float wall cuts through the instruction numbers.**  20010203 is past
+16,777,216, where a float counts by twos -- in fact no float holds it at
+all: the nearest float is 20010204, and `fp.convert(fp.F, 20010203.0)`
+returns exactly that with the inexact flag as the only trace.  Arithmetic
+done in floats lands one register off before anything is added.  The host
+therefore mutates on the integer the whole double names and stores back as
+a double, which counts by ones to 2^53 and is exact for every eight-digit
+instruction.  A program doing this to itself needs `.D` registers, which is
+what `smc_edit.mant` already does.  `test_evolve.py` asserts the exact path
+against the float one.
+
+Measured, at the defaults (population 256, 8 cases, 4 slots, seed 6) on the
+Radeon 8060S: sum of squared error 0.0 -- all eight outputs exact, and equal
+to the reference's -- at generation 32 of a 900 budget, in 2.5 s, about
+75 ms a generation, of which the kernel is 1 ms: the fleet does the running,
+the host does the thinking, and a generation costs a process spawn, not a
+kernel.  The visible descent (1438.5, 1302.5, ..., 112.5, 70.5, 46.5, 2.75,
+0) is the graded landscape working.  Six of the seven other seeds tried in
+the same budget converged too -- generations 44, 371, 651, 51, 791 and 47,
+the slowest in 58 s -- and one stalled at squared error 70 for the whole
+run.  The winners are the programs a human would write (`DIV d4,
+d0, d1` then `FMA d4, d0, d0`; or `MUL d4, d0, d4` after `ADD d4, d0, d1`),
+reached by arithmetic on numbers.  The same loop runs unchanged on the
+reference simulator alone (`--demo --cpu`), so the GPU is speed, not a
+requirement.
+
+What this is not: learning, and not yet *inside* the machine.  The host
+drives the loop; the machines only run what they are patched with.  A
+population as cells, mutating its own fitness in place -- evolution the
+machine performs on itself -- is still road, not building.
+
 ## Self-programming, intelligence, and how far this goes
 
 The machine's programs are numbers, and it can write them: `smc_emit.mant`
