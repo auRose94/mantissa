@@ -109,17 +109,18 @@ and compare against answers computed independently.
 
 The road from here, in order of value:
 
-1. **Arrays**: `a[i]` with `i` chopped to a whole cell address; the base is a
-   literal, the offset arithmetic is `MUL` and `ADD`.  This unlocks real
-   programs (sorting, matrices, the Mandelbrot without hand-patched cells).
-2. **Functions**: a link register exists (`JAL`/`JMP lr`); a calling
-   convention needs a stack (`sp` exists and points at the top of memory) and
-   a register-save rule.
+1. ~~**Arrays**~~: built.  `a[i]` is the base plus `MUL`/`ADD`; arrays are
+   zero-filled, aligned, and there are no bounds checks because the machine
+   faults on its own.
+2. ~~**Functions**~~: built.  `fn name(params) { return expr }`, recursion
+   included.  The caller pushes the link, its variable registers and any
+   temporaries it still holds, then the arguments; the callee pops its
+   arguments and answers in `d0`; the caller parks the answer before
+   restoring.  The link goes in deepest, because the callee pops off the top.
 3. **Peephole at the assembly level**: `LDI` folded into the instruction that
    uses it (the assembler's literal handling already rounds; the compiler can
    decide format), `MOV` elision across assignments, branch to branch.
-4. **Vector intrinsics**: when SIMD lands, `vadd(a, b)` maps one source line
-   to one `VADD4`.
+4. **Vector intrinsics**: `vadd(a, b)` maps one source line to one `VADD4`.
 
 ## Self-programming, intelligence, and how far this goes
 

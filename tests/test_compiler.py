@@ -297,3 +297,184 @@ class Arrays(unittest.TestCase):
         self.assertIn("b:     SPACE 8", text)
         self.assertLess(text.index("b:     SPACE"), text.index("LDI.D  d6"))
         self.assertEqual(list(image.cells[:16]), [0] * 16)  # zero-filled, before the code
+
+
+class Functions(unittest.TestCase):
+    def check(self, source, expected_lines):
+        out, result, warnings, _ = run_program(source)
+        self.assertEqual(result.reason, "halt", result.cpu.fault)
+        self.assertEqual(out.splitlines(), [f"{v!r}" for v in expected_lines])
+        return warnings
+
+    def test_a_call_and_its_value(self):
+        self.check("""
+            fn area(r) {
+                return 3.0 * r * r
+            }
+            print area(2.0)
+            print area(3.0)
+        """, [12.0, 27.0])
+
+    def test_two_arguments_in_order(self):
+        self.check("""
+            fn sub(a, b) {
+                return a - b
+            }
+            print sub(10.0, 4.0)
+            print sub(4.0, 10.0)
+        """, [6.0, -6.0])
+
+    def test_callers_variables_survive_the_call(self):
+        # the function has its own x; the main's x must come back untouched
+        self.check("""
+            fn bump(r) {
+                var x = r + 1.0
+                return x
+            }
+            var x = 5.0
+            print bump(1.0)
+            print bump(2.0)
+            print x
+        """, [2.0, 3.0, 5.0])
+
+    def test_early_return_from_inside_a_loop(self):
+        self.check("""
+            fn first_below(x) {
+                var i = 10.0
+                while i > 0.0 {
+                    if i < x {
+                        return i
+                    }
+                    i = i - 1.0
+                }
+                return 0.0
+            }
+            print first_below(7.5)
+            print first_below(0.5)
+        """, [7.0, 0.0])
+
+    def test_recursion(self):
+        self.check("""
+            fn fact(n) {
+                if n <= 1.0 {
+                    return 1.0
+                }
+                return n * fact(n - 1.0)
+            }
+            print fact(6.0)
+        """, [720.0])
+
+    def test_a_call_before_the_definition(self):
+        self.check("""
+            print twice(21.0)
+            fn twice(x) {
+                return x + x
+            }
+        """, [42.0])
+
+    def test_calls_inside_expressions_with_live_temps(self):
+        self.check("""
+            fn triple(x) {
+                return x * 3.0
+            }
+            var a = 2.0
+            print triple(a) * triple(a + 1.0) + triple(a + 2.0)
+            print a
+        """, [6.0 * 9.0 + 12.0, 2.0])
+
+    def test_zero_argument_function(self):
+        self.check("""
+            fn seven() {
+                return 7.0
+            }
+            print seven() + 1.0
+        """, [8.0])
+
+    def test_bare_return_is_zero(self):
+        self.check("""
+            fn f(x) {
+                if x < 0.0 {
+                    return
+                }
+                return x
+            }
+            print f(4.0)
+            print f(-4.0)
+        """, [4.0, 0.0])
+
+    def test_falling_off_the_end_is_zero(self):
+        self.check("""
+            fn f(x) {
+                var y = x + 1.0
+            }
+            print f(9.0)
+        """, [0.0])
+
+    def test_a_function_reads_an_array(self):
+        self.check("""
+            array a[3]
+            fn sum3() {
+                return a[0] + a[1] + a[2]
+            }
+            a[0] = 2.0
+            a[1] = 4.0
+            a[2] = 6.0
+            print sum3()
+        """, [12.0])
+
+    def test_deep_recursion(self):
+        # fib(10): 177 calls; every frame's variables and link ride the stack
+        self.check("""
+            fn fib(n) {
+                if n < 2.0 {
+                    return n
+                }
+                return fib(n - 1.0) + fib(n - 2.0)
+            }
+            print fib(10.0)
+        """, [55.0])
+
+    def test_a_function_writes_an_array(self):
+        self.check("""
+            array a[4]
+            fn fill(step) {
+                var i = 0.0
+                while i < 4.0 {
+                    a[i] = i * step
+                    i = i + 1.0
+                }
+                return a[3]
+            }
+            print fill(5.0)
+            print a[1]
+        """, [15.0, 5.0])
+
+    def test_function_errors(self):
+        cases = [
+            ("print nope(1.0)\n", "not a fn"),
+            ("fn f(x) { return x }\nprint f(1.0, 2.0)\n", "takes 1 argument(s)"),
+            ("fn f(x) { return x }\nfn f(y) { return y }\n", "declared twice"),
+            ("fn main() { return 1.0 }\n", "cannot be named 'main'"),
+            ("fn sqrt(x) { return x }\n", "is a builtin"),
+            ("return 1.0\n", "return outside a function"),
+            ("while 1.0 < 2.0 { fn f() { return 1.0 } }\n", "top level only"),
+            ("fn f(a, b, c, d, e, g, h) { return a }\n", "too many arguments"),
+            ("fn f(a, a) { return a }\n", "declared twice"),
+            ("fn f() { array a[4] return 1.0 }\n", "top level only"),
+            ("array f[4]\nfn f() { return 1.0 }\n", "declared twice"),
+        ]
+        for source, expected in cases:
+            with self.assertRaises(m4c.CompileError) as caught:
+                m4c.compile_source(source)
+            self.assertIn(expected, str(caught.exception), source)
+
+    def test_params_count_toward_the_variable_registers(self):
+        self.check("""
+            fn f(a, b, c, d, e, g) {
+                return a + b + c + d + e + g
+            }
+            print f(1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+        """, [21.0])
+        with self.assertRaises(m4c.CompileError) as caught:
+            m4c.compile_source("fn f(a, b, c, d, e, g) { var h = 1.0 return h }\n")
+        self.assertIn("no register left", str(caught.exception))

@@ -43,7 +43,7 @@ Needs Python 3.10 or newer and nothing else.  From this directory:
     python programs/mandel_zoom.py
     python -m unittest discover -s tests -t .
 
-The compiler, for a small float-only language:
+The compiler, for a small float-only language — functions, `while`, arrays:
 
     python3 compiler/m4c.py demo.m4 > demo.mant
     python -m mantissa run demo.mant
@@ -290,8 +290,11 @@ port must reproduce is the value.
 ## The compiler
 
 `compiler/m4c.py` compiles a small float-only language — variables (doubles),
-`while`, `if`/`else`, `sqrt` and a few builtins, `print`, and arrays — to
-Mantissa assembly.  What it does beyond the obvious, each piece tested:
+`while`, `if`/`else`, functions with recursion, `sqrt` and a few builtins,
+`print`, and arrays — to Mantissa assembly.  Calls are real, not inlined:
+the caller pushes the link, its variables and its live temporaries, then the
+arguments, and the callee answers in `d0`.  What it does beyond the obvious,
+each piece tested:
 
 - **Constant folding, but only what the machine computes exactly.**
   `sqrt(4.0)` folds; `sqrt(2.0)` does not.

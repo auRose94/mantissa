@@ -3,18 +3,29 @@
     python3 m4c.py program.m4            print the assembly
     python3 m4c.py program.m4 --out a.mant
 
-The language (v0):
+The language (v1):
 
     var x = 0.0                 every variable is a double, forever
     array a[10]                 arrays live in memory, doubles, zero-filled
     a[0] = 1.5
     print a[0] + x              the console spells the value; the machine hands it over
     while i < 10.0 { ... }      while, if, else, with { } blocks
+    fn area(r) { return 3.0 * r * r }   functions at the top level; return, or
+    print area(2.0)                     fall off the end for 0.0.  Recursion works.
 
-    expressions: + - * / < <= > >= == !=, numbers, variables, and
+    expressions: + - * / < <= > >= == !=, numbers, variables, calls, and
     sqrt(x) fma(a, b, c) floor(x) ceil(x) chop(x) round(x) min(a, b) max(a, b)
     mod(a, b) rem(a, b) scalb(x, n) logb(x) abs(x) neg(x) sign(a, b) next(x, y)
     classify(x) compare(a, b) lt(a, b) le(a, b) eq(a, b)
+
+Functions see their own variables only -- a function and the main code each
+get the variable registers to themselves.  The calling convention is on the
+machine's stack, sp being f31 as the runner starts it: the caller pushes its
+variable registers and any expression temporaries it still holds, then the
+arguments, and calls with JAL into f30; the callee pops its arguments into
+d0.., computes, and leaves the answer in d0; the caller parks the answer in a
+fresh temporary before restoring what it pushed.  Every frame's variables are
+saved by its caller, which is what makes recursion work.
 
 There are no integers in the language because there are none in the machine.
 Counters count while their format keeps step: a double counts to 2^53.  The
@@ -55,7 +66,11 @@ from mantissa import asm, fp  # noqa: E402
 
 TEMP_LOW, TEMP_HIGH = 8, 28   # d8..d27 are the expression stack; d0..d5 are variables
 SIZE_REG = "d6"              # holds the element size 4.0, for array addressing
-MAX_VARIABLES = 6
+LINK_SHUTTLE = "d7"          # carries f30 to the stack: no scope ever holds d7
+STACK_STEP = "f2"            # holds 4.0 in a float register, for sp moves
+LINK_REG, SP = "f30", "f31"  # JAL leaves pc+8 in f30; the stack pointer is f31
+CELLS_PER_DOUBLE = 4.0       # a stack slot is one double, four cells
+MAX_VARIABLES = 6            # per scope: main's, and each function's params+locals
 WALLS = {2048.0: "half", 16777216.0: "float", 9007199254740992.0: "double"}
 
 BINARY_OPS = {"add": "ADD", "sub": "SUB", "mul": "MUL", "div": "DIV",
@@ -157,7 +172,17 @@ class Parser:
 
     def statement(self, into):
         line, kind, value = self.peek()
-        if kind == "name" and value == "var":
+        if kind == "name" and value == "fn":
+            raise CompileError(line, "a fn is declared at the top level only")
+        if kind == "name" and value == "return":
+            self.take()
+            nxt = self.peek()
+            if nxt[1] == "end" or (nxt[1] == "op" and nxt[2] in (";", "}")):
+                into.append(["return", line, None])
+            else:
+                into.append(["return", line, self.expression()])
+            self.semicolon()
+        elif kind == "name" and value == "var":
             self.take()
             while True:
                 line2, name = self.expect("name")
@@ -221,6 +246,26 @@ class Parser:
         else:
             raise CompileError(line, f"expected a statement, found '{value or kind}'")
 
+    def parse_fn(self, into):
+        """A top-level `fn name(params) { body }`.  Called by compile_source
+        when the next token is `fn`; statement() refuses it anywhere deeper."""
+        line, _, _ = self.take()
+        line2, name = self.expect("name")
+        self.expect("op", "(")
+        params = []
+        if not (self.peek()[1] == "op" and self.peek()[2] == ")"):
+            while True:
+                line3, param = self.expect("name")
+                params.append(param)
+                if self.peek()[1] == "op" and self.peek()[2] == ",":
+                    self.take()
+                    continue
+                break
+        self.expect("op", ")")
+        body = []
+        self.statements_until_close(body)
+        into.append(["fn", line, name, params, body])
+
     PRECEDENCE = (("lt2", "le2", "gt2", "ge2", "eq2", "ne2"),
                   ("add", "sub"), ("mul", "div"))
 
@@ -259,6 +304,16 @@ class Parser:
         if kind == "num":
             return ("num", line, value)
         if kind == "name":
+            if self.peek()[1] == "op" and self.peek()[2] == "(" and value not in BUILTINS:
+                self.take()
+                args = []
+                if not (self.peek()[1] == "op" and self.peek()[2] == ")"):
+                    args.append(self.expression())
+                    while self.peek()[1] == "op" and self.peek()[2] == ",":
+                        self.take()
+                        args.append(self.expression())
+                self.expect("op", ")")
+                return ("usercall", line, value, args)
             if value in BUILTINS:
                 self.expect("op", "(")
                 args = [self.expression()]
@@ -328,6 +383,8 @@ def fold(node):
             if root.is_integer():
                 return ("num", line, float(root))  # only exact roots: 4 -> 2, not 2 -> 1.41...
         return ("call", line, name, args)
+    if kind == "usercall":
+        return ("usercall", node[1], node[2], [fold(a) for a in node[3]])
     return node
 
 
@@ -349,6 +406,8 @@ def identities(node):
         return ("neg", node[1], identities(node[2]))
     if kind == "call":
         return ("call", node[1], node[2], [identities(a) for a in node[3]])
+    if kind == "usercall":
+        return ("usercall", node[1], node[2], [identities(a) for a in node[3]])
     return node
 
 
@@ -361,7 +420,7 @@ def collect_literals(node, pool):
         collect_literals(node[4], pool)
     elif kind == "neg":
         collect_literals(node[2], pool)
-    elif kind == "call":
+    elif kind in ("call", "usercall"):
         for a in node[3]:
             collect_literals(a, pool)
 
@@ -373,6 +432,9 @@ def simplify_all(nodes):
             node[3] = identities(fold(node[3]))
         elif kind == "print":
             node[2] = identities(fold(node[2]))
+        elif kind == "return":
+            if node[2] is not None:
+                node[2] = identities(fold(node[2]))
         elif kind == "while":
             node[2] = identities(fold(node[2]))
             simplify_all(node[3])
@@ -389,6 +451,9 @@ def collect_all(nodes, pool):
             collect_literals(node[3], pool)
         elif kind == "print":
             collect_literals(node[2], pool)
+        elif kind == "return":
+            if node[2] is not None:
+                collect_literals(node[2], pool)
         elif kind == "while":
             collect_literals(node[2], pool)
             collect_all(node[3], pool)
@@ -411,6 +476,9 @@ def check_walls(nodes, warnings):
             check_walls_expr(node[4], warnings)
         elif kind == "print":
             check_walls_expr(node[2], warnings)
+        elif kind == "return":
+            if node[2] is not None:
+                check_walls_expr(node[2], warnings)
         elif kind == "while":
             check_walls_expr(node[2], warnings)
             check_walls(node[3], warnings)
@@ -433,7 +501,7 @@ def check_walls_expr(node, warnings):
         check_walls_expr(node[4], warnings)
     elif kind == "neg":
         check_walls_expr(node[2], warnings)
-    elif kind == "call":
+    elif kind in ("call", "usercall"):
         for a in node[3]:
             check_walls_expr(a, warnings)
 
@@ -449,6 +517,8 @@ class Compiler:
         self.variables = {}
         self.variable_count = 0
         self.arrays = {}          # name -> elements
+        self.functions = {}       # name -> arity
+        self.in_function = False
         self.lines = []
         self.labels = 0
         self.pool = {}
@@ -461,6 +531,13 @@ class Compiler:
 
     def emit(self, text):
         self.lines.append("        " + text)
+
+    def live_temps(self):
+        """The temporaries currently checked out: exactly what a call has to
+        save, because the callee spends them freely.  The pool's registers are
+        read-only and every scope shares them, so they stay put."""
+        managed = range(TEMP_LOW, TEMP_HIGH - len(self.pool))
+        return sorted(set(managed) - set(self.free_temps))
 
     # the temporary register stack --------------------------------------------------
     # expr() returns (register, owned): owned registers are temporaries and go
@@ -517,9 +594,54 @@ class Compiler:
             return out, True
         if kind == "call":
             return self.call(node)
+        if kind == "usercall":
+            return self.usercall(node)
         if kind == "bin":
             return self.bin(node)
         raise CompileError(0, f"cannot compile {kind}")
+
+    def usercall(self, node):
+        """A call to a fn the program declared.  The caller pushes its variable
+        registers and every temporary it still holds, then the arguments, and
+        calls; the callee pops its arguments and leaves the answer in d0; the
+        caller parks the answer in a fresh temporary before restoring what it
+        pushed.  Every frame is saved by its caller, which is what makes
+        recursion work."""
+        _, line, name, args = node
+        saved = self.live_temps()
+        # the link goes in deepest: the callee pops its arguments off the top,
+        # and an inner call would otherwise overwrite f30, making every frame
+        # below the innermost return twice, popping slots that are not its own.
+        # f30 cannot itself be stored as a double, so the shuttle carries it --
+        # and every slot on the stack stays one double
+        self.emit(f"CVT.D  {LINK_SHUTTLE}, {LINK_REG}")
+        self.emit(f"SUB.F  {SP}, {SP}, {STACK_STEP}")
+        self.emit(f"ST.D   [{SP}], {LINK_SHUTTLE}")
+        for register in range(self.variable_count):
+            self.emit(f"SUB.F  {SP}, {SP}, {STACK_STEP}")
+            self.emit(f"ST.D   [{SP}], d{register}")
+        for register in saved:
+            self.emit(f"SUB.F  {SP}, {SP}, {STACK_STEP}")
+            self.emit(f"ST.D   [{SP}], d{register}")
+        for a in args:
+            register, owned = self.expr(a)
+            self.emit(f"SUB.F  {SP}, {SP}, {STACK_STEP}")
+            self.emit(f"ST.D   [{SP}], {register}")
+            if owned:
+                self.give_temp(register)
+        self.emit(f"JAL    {LINK_REG}, {name}")
+        out = self.take_temp()
+        self.emit(f"MOV.D  {out}, d0")
+        for register in reversed(saved):
+            self.emit(f"LD.D   d{register}, [{SP}]")
+            self.emit(f"ADD.F  {SP}, {SP}, {STACK_STEP}")
+        for register in reversed(range(self.variable_count)):
+            self.emit(f"LD.D   d{register}, [{SP}]")
+            self.emit(f"ADD.F  {SP}, {SP}, {STACK_STEP}")
+        self.emit(f"LD.D   {LINK_SHUTTLE}, [{SP}]")
+        self.emit(f"ADD.F  {SP}, {SP}, {STACK_STEP}")
+        self.emit(f"CVT.F  {LINK_REG}, {LINK_SHUTTLE}")
+        return out, True
 
     def bin(self, node):
         _, line, op, left, right = node
@@ -568,6 +690,8 @@ class Compiler:
             self.pending_zero = None
         if kind == "arraydecl":
             _, line, name, elements = node
+            if self.in_function:
+                raise CompileError(line, "arrays are declared at the top level only")
             self.arrays[name] = elements   # registered in the pre-pass; SPACE emitted first
         elif kind == "astore":
             _, line, name, index, value = node
@@ -617,6 +741,19 @@ class Compiler:
             self.emit(f"PUT.D  {register}")
             if owned:
                 self.give_temp(register)
+        elif kind == "return":
+            _, line, value = node
+            if not self.in_function:
+                raise CompileError(line, "return outside a function")
+            if value is None:
+                self.emit("LDI.D  d0, 0.0")
+            else:
+                register, owned = self.expr(value)
+                if register != "d0":
+                    self.emit(f"MOV.D  d0, {register}")
+                if owned:
+                    self.give_temp(register)
+            self.emit(f"JMP    {LINK_REG}")
         elif kind == "while":
             _, line, condition, body = node
             top, end = self.label(), self.label()
@@ -654,19 +791,127 @@ class Compiler:
         else:
             raise CompileError(0, f"cannot compile {kind}")
 
+    def function(self, node):
+        """A fn's scope: the parameters arrive in d0.., its own variables take
+        the registers from there, and falling off the end returns 0.0."""
+        _, line, name, params, body = node
+        if len(params) > MAX_VARIABLES:
+            raise CompileError(line, f"{name} takes too many arguments: a frame is "
+                                     f"{MAX_VARIABLES} registers wide")
+        self.in_function = True
+        outer_variables, outer_count = self.variables, self.variable_count
+        self.variables = {}
+        self.variable_count = len(params)
+        self.pending_zero = None
+        for k, param in enumerate(params):
+            if param in self.variables:
+                raise CompileError(line, f"'{param}' is declared twice")
+            self.variables[param] = f"d{k}"
+        self.emit(f"{name}:")
+        for register in reversed(range(len(params))):
+            self.emit(f"LD.D   d{register}, [{SP}]")
+            self.emit(f"ADD.F  {SP}, {SP}, {STACK_STEP}")
+        for statement2 in body:
+            self.statement(statement2)
+        if self.pending_zero is not None:
+            self.emit(f"LDI.D  {self.pending_zero}, 0.0")
+            self.pending_zero = None
+        self.emit("LDI.D  d0, 0.0")
+        self.emit(f"JMP    {LINK_REG}")
+        self.in_function = False
+        self.variables, self.variable_count = outer_variables, outer_count
+
+
+def check_calls(nodes, signatures, inside):
+    """Every call names a declared fn with the right arity, return appears
+    only inside a fn, and arrays are declared only at the top level.  Running
+    this over the AST is what lets a fn be called before its definition."""
+    for node in nodes:
+        kind = node[0]
+        if kind == "arraydecl":
+            if inside:
+                raise CompileError(node[1], "arrays are declared at the top level only")
+        elif kind == "return":
+            if not inside:
+                raise CompileError(node[1], "return outside a function")
+            if node[2] is not None:
+                check_calls_expr(node[2], signatures)
+        elif kind == "assign":
+            check_calls_expr(node[3], signatures)
+        elif kind == "print":
+            check_calls_expr(node[2], signatures)
+        elif kind == "astore":
+            check_calls_expr(node[3], signatures)
+            check_calls_expr(node[4], signatures)
+        elif kind == "while":
+            check_calls_expr(node[2], signatures)
+            check_calls(node[3], signatures, inside)
+        elif kind == "if":
+            check_calls_expr(node[2], signatures)
+            check_calls(node[3], signatures, inside)
+            check_calls(node[4], signatures, inside)
+
+
+def check_calls_expr(node, signatures):
+    kind = node[0]
+    if kind == "usercall":
+        _, line, name, args = node
+        if name not in signatures:
+            raise CompileError(line, f"'{name}' is not a fn this program declares")
+        if len(args) != signatures[name]:
+            raise CompileError(line, f"{name} takes {signatures[name]} argument(s), "
+                                     f"not {len(args)}")
+        for a in args:
+            check_calls_expr(a, signatures)
+    elif kind == "bin":
+        check_calls_expr(node[3], signatures)
+        check_calls_expr(node[4], signatures)
+    elif kind == "neg":
+        check_calls_expr(node[2], signatures)
+    elif kind == "index":
+        check_calls_expr(node[3], signatures)
+    elif kind == "call":
+        for a in node[3]:
+            check_calls_expr(a, signatures)
+
 
 def compile_source(source):
     """(assembly text, image, warnings).  CompileError carries the line."""
-    statements = []
+    items = []
     parser = Parser(lex(source))
     while parser.peek()[1] != "end":
-        parser.statement(statements)
-    simplify_all(statements)
+        if parser.peek()[1] == "name" and parser.peek()[2] == "fn":
+            parser.parse_fn(items)
+        else:
+            parser.statement(items)
+    functions = [node for node in items if node[0] == "fn"]
+    main = [node for node in items if node[0] != "fn"]
+    signatures = {}
+    for node in functions:
+        _, line, name, params, _ = node
+        if name in signatures:
+            raise CompileError(line, f"'{name}' is declared twice")
+        if name in BUILTINS:
+            raise CompileError(line, f"'{name}' is a builtin; a fn cannot take its name")
+        if name == "main":
+            raise CompileError(line, "a fn cannot be named 'main': the machine starts there")
+        signatures[name] = len(params)
+    for node in functions:
+        check_calls(node[4], signatures, True)
+    check_calls(main, signatures, False)
+    simplify_all(main)
+    for node in functions:
+        simplify_all(node[4])
     pool = {}
-    collect_all(statements, pool)
+    collect_all(main, pool)
+    for node in functions:
+        collect_all(node[4], pool)
     warnings = []
-    check_walls(statements, warnings)
+    check_walls(main, warnings)
+    for node in functions:
+        check_walls(node[4], warnings)
     compiler = Compiler()
+    compiler.functions = signatures
     compiler.pool = {fp.to_bits(fp.D, value): f"d{TEMP_HIGH - 1 - k}"
                      for k, (value, uses) in enumerate(
                          sorted(pool.items(), key=lambda kv: (-kv[1], kv[0])))
@@ -677,9 +922,9 @@ def compile_source(source):
     # the arrays' space comes first in the image: position 0 is 4-cell aligned,
     # and every array's size is a multiple of 4 cells, so all bases stay aligned
     array_lines = []
-    for node in statements:
+    for node in main:
         if node[0] == "arraydecl":
-            if node[2] in compiler.arrays or node[2] in compiler.variables:
+            if node[2] in compiler.arrays or node[2] in compiler.variables or node[2] in signatures:
                 raise CompileError(node[1], f"'{node[2]}' is declared twice")
             compiler.arrays[node[2]] = node[3]
             array_lines.append(f"{node[2]}:     SPACE {4 * node[3]}")
@@ -689,7 +934,14 @@ def compile_source(source):
         compiler.emit(f"LDI.D  {SIZE_REG}, 4.0      ; the element size, for array addressing")
     for key, register in sorted(compiler.pool.items(), key=lambda kv: kv[1]):
         compiler.emit(f"LDI.D  {register}, {compiler.pool_values[key]!r}      ; the literal pool")
-    for node in statements:
+    if signatures:
+        compiler.emit(f"LDI.F  {STACK_STEP}, {CELLS_PER_DOUBLE!r}   ; the stack step, one double")
+        over = compiler.label()
+        compiler.emit(f"BR     {over}")
+        for node in functions:
+            compiler.function(node)
+        compiler.emit(f"{over}:")
+    for node in main:
         compiler.statement(node)
     if compiler.pending_zero is not None:
         compiler.emit(f"LDI.D  {compiler.pending_zero}, 0.0")
