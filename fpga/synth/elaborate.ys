@@ -1,0 +1,12 @@
+# Elaborate the synthesizable RTL and look for what simulation would hide:
+# latches, combinational loops, multiple drivers, unused or missing pieces.
+# Fast: no technology mapping.  A small memory is used so that the check does
+# not spend its time on 65536 cells.
+#
+#   yosys -s synth/elaborate.ys      (from fpga/)
+read_verilog -sv rtl/mantissa_pkg.sv rtl/mantissa_core.sv rtl/mantissa_cell_ram.sv rtl/mantissa_top.sv synth/fpu_blackbox.sv
+hierarchy -check -top mantissa_top -chparam AW 10
+proc
+check -assert
+opt
+stat

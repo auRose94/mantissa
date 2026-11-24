@@ -1,0 +1,11 @@
+# (i) The core alone, the floating point unit as a black box.
+#
+# The cell memory is left out on purpose: it is 2**AW by 16 bits of block RAM
+# whose size is a build parameter, and mapping it to gates would only swamp
+# the count of the logic around it.  fpga/synth/cell_ram.ys sizes it apart.
+#
+#   yosys -s synth/core_blackbox.ys      (from fpga/)
+read_verilog -sv rtl/mantissa_pkg.sv rtl/mantissa_core.sv synth/fpu_blackbox.sv
+hierarchy -check -top mantissa_core
+synth -top mantissa_core
+stat

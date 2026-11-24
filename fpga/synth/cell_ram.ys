@@ -1,0 +1,8 @@
+# The cell memory on its own, 65536 cells of 16 bits in four banks: what it
+# takes when the banks are mapped to block RAM rather than to gates.
+#
+#   yosys -s synth/cell_ram.ys      (from fpga/)
+read_verilog -sv rtl/mantissa_cell_ram.sv
+hierarchy -check -top mantissa_cell_ram
+synth_xilinx -top mantissa_cell_ram -family xc7
+stat
