@@ -71,6 +71,15 @@ _BINARY = {
     OP["FLOOR_TO"]: fp.floor_to, OP["CEIL_TO"]: fp.ceil_to,
     OP["CHOP_TO"]: fp.trunc_to, OP["ROUND_TO"]: fp.round_to,
 }
+# Vector arithmetic: fn(fmt, x, y) per lane, over consecutive registers.
+# The destination may overlap a source: each lane reads only its own lanes.
+_VECTOR = {
+    OP["VADD2"]: (fp.add, 2), OP["VSUB2"]: (fp.sub, 2), OP["VMUL2"]: (fp.mul, 2),
+    OP["VDIV2"]: (fp.div, 2), OP["VMIN2"]: (fp.fmin, 2), OP["VMAX2"]: (fp.fmax, 2),
+    OP["VADD4"]: (fp.add, 4), OP["VSUB4"]: (fp.sub, 4), OP["VMUL4"]: (fp.mul, 4),
+    OP["VDIV4"]: (fp.div, 4), OP["VMIN4"]: (fp.fmin, 4), OP["VMAX4"]: (fp.fmax, 4),
+}
+
 # One-register arithmetic: fn(fmt, x) -> (value, flags), keyed by opcode number.
 _UNARY = {
     OP["SQRT"]: fp.sqrt, OP["NEG"]: fp.neg, OP["ABS"]: fp.fabs, OP["LOGB"]: fp.logb,
@@ -109,6 +118,31 @@ def _execute(cpu, mem, out):
     if fn is not None:
         value, fl = fn(_format(a), _read(cpu, b), _read(cpu, c))
         return _write(cpu, a, value, pc + 4, flags | fl)
+
+    if op in _VECTOR:
+        fn, lanes = _VECTOR[op]
+        for code in (a, b, c):
+            if (code % 32) + lanes > 32:
+                raise Fault(ILLEGAL, "a vector group runs past the end of its register file")
+        cpu2 = cpu
+        for lane in range(lanes):
+            value, fl = fn(_format(a), _read(cpu2, b + lane), _read(cpu2, c + lane))
+            cpu2 = _write(cpu2, a + lane, value, pc + 4, flags | fl)
+            flags |= fl
+        return cpu2
+
+    if op in (OP["VFMA2"], OP["VFMA4"]):
+        lanes = 2 if op == OP["VFMA2"] else 4
+        for code in (a, b, c):
+            if (code % 32) + lanes > 32:
+                raise Fault(ILLEGAL, "a vector group runs past the end of its register file")
+        cpu2 = cpu
+        for lane in range(lanes):
+            value, fl = fp.fma(_format(a), _read(cpu2, b + lane), _read(cpu2, c + lane),
+                               _read(cpu2, a + lane))
+            cpu2 = _write(cpu2, a + lane, value, pc + 4, flags | fl)
+            flags |= fl
+        return cpu2
 
     fn = _UNARY.get(op)
     if fn is not None:

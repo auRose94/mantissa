@@ -127,6 +127,14 @@ is optional: every register already says what type it holds.
 | 68 | `JAL fa, target` | leaves `pc + 8` in `fa` |
 | 69 | `JMP fa` | |
 | 70, 71 | `PUT r`, `PUTC r` | print the value, or one code point |
+| 72–78 | `VADD2`, `VSUB2`, `VMUL2`, `VDIV2`, `VFMA2`, `VMIN2`, `VMAX2` `r, r, r` | two lanes: rd..rd+1 = ra..ra+1 op rb..rb+1 |
+| 79–85 | `VADD4`, `VSUB4`, `VMUL4`, `VDIV4`, `VFMA4`, `VMIN4`, `VMAX4` `r, r, r` | four lanes: rd..rd+3 = ra..ra+3 op rb..rb+3; `VFMA` accumulates into rd |
+
+A vector instruction works on consecutive registers of one file: one operand
+field names the first register of each group, the groups may not run past
+register 31 of the file, and the destination may overlap a source (each lane
+reads only its own lanes).  Everything else -- rounding, flags, NaNs -- is
+per lane, exactly as the scalar instruction.  See `EXTENSIONS.md`.
 
 A target is a cell address on a four-cell boundary.  Arithmetic needs all of
 its registers to be of one type; `CVT` needs two different types; `SPLIT`
@@ -270,3 +278,7 @@ port must reproduce is the value.
     EXTENSIONS.md  SIMD, a screen device, optimisation patterns, and the road
 
 The name is Mantissa.  It stuck.
+
+## License
+
+Apache License 2.0 -- see `LICENSE`.  Copyright 2026 Rosemary Mercury.

@@ -1,0 +1,74 @@
+; simd.mant -- every vector instruction, once each.
+;
+; The vector instructions work on 2 or 4 consecutive registers of one file,
+; one field naming the first register of each group: VADD4 d8, d16, d24 means
+; d8..d11 = d16..d19 + d24..d27.  Each line below prints one lane of the
+; result, chosen to show what the instruction did.
+        LDI.D  d16, 10
+        LDI.D  d17, 20
+        LDI.D  d18, 30
+        LDI.D  d19, 40
+        LDI.D  d24, 100
+        LDI.D  d25, 200
+        LDI.D  d26, 300
+        LDI.D  d27, 400
+        VADD4  d8, d16, d24
+        PUT.D  d9                ; 20 + 200
+        VSUB4  d8, d24, d16
+        PUT.D  d10               ; 300 - 30
+        VMUL4  d8, d16, d24
+        PUT.D  d11               ; 40 * 400
+        LDI.D  d16, 1
+        LDI.D  d24, 0
+        VDIV4  d8, d16, d24      ; 1 / 0 in every lane
+        PUT.D  d8
+        LDI.D  d16, 2
+        LDI.D  d17, 3
+        LDI.D  d24, 5
+        LDI.D  d25, 7
+        VFMA2  d8, d16, d24      ; d8..d9 += 2*5, 3*7
+        PUT.D  d8
+        PUT.D  d9
+        LDI.D  d16, 3
+        LDI.D  d17, 9
+        LDI.D  d24, 5
+        LDI.D  d25, 2
+        VMIN2  d8, d16, d24
+        VMAX2  d9, d16, d24
+        PUT.D  d8
+        PUT.D  d9
+        LDI.D  d8, 1
+        LDI.D  d9, 2
+        LDI.D  d10, 3
+        LDI.D  d11, 4
+        VFMA4  d8, d16, d24      ; d8..d11 += 10*100, 20*200, 30*300, 40*400
+        PUT.D  d10               ; 3 + 30 * 300 = 9003
+        LDI.D  d16, 30
+        LDI.D  d17, 300
+        LDI.D  d24, 40
+        LDI.D  d25, 400
+        VMIN4  d8, d16, d24
+        PUT.D  d8
+        VMAX4  d8, d16, d24
+        PUT.D  d9
+; the two-lane forms, in half, where the counting walls are close enough to trip over
+        LDI.H  h10, 8
+        LDI.H  h11, 9
+        LDI.H  h12, 4
+        LDI.H  h13, 3
+        VSUB2  h8, h10, h12      ; h8..h9 = 8 - 4, 9 - 3
+        PUT.H  h8
+        VMUL2  h8, h10, h12
+        PUT.H  h8
+        LDI.H  h12, 0
+        VDIV2  h8, h10, h12      ; 8 / 0
+        PUT.H  h8
+; the same in half, where the counting walls are close enough to trip over
+        LDI.H  h8, 2048
+        LDI.H  h9, 4096
+        LDI.H  h16, 1
+        LDI.H  h17, 1
+        VADD2  h8, h8, h16       ; both round back: the spacing is 2, then 4
+        PUT.H  h8
+        PUT.H  h9
+        HALT

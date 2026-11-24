@@ -39,7 +39,7 @@ class Encoding(unittest.TestCase):
     def test_numbers_that_are_not_instructions(self):
         strangers = [
             0, 5, 999999,                 # opcode digits 00: data, or nothing
-            72000000, 99000000,           # no such opcode
+            86000000, 99000000,           # no such opcode
             100000000, -20000102,         # not eight digits
             float("nan"), float("inf"),
             isa.encode(20, 96, 0, 0), isa.encode(20, 0, 99, 0),  # 96 to 99 name no register

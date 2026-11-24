@@ -66,6 +66,12 @@ _TABLE = [
     ("BZ", 66, "a", False), ("BNZ", 67, "a", False), ("JAL", 68, "a", False),
     ("JMP", 69, "a", False),
     ("PUT", 70, "a", False), ("PUTC", 71, "a", False),
+    ("VADD2", 72, "abc", True), ("VSUB2", 73, "abc", True), ("VMUL2", 74, "abc", True),
+    ("VDIV2", 75, "abc", True), ("VFMA2", 76, "abc", True), ("VMIN2", 77, "abc", True),
+    ("VMAX2", 78, "abc", True),
+    ("VADD4", 79, "abc", True), ("VSUB4", 80, "abc", True), ("VMUL4", 81, "abc", True),
+    ("VDIV4", 82, "abc", True), ("VFMA4", 83, "abc", True), ("VMIN4", 84, "abc", True),
+    ("VMAX4", 85, "abc", True),
 ]
 
 OPS = [Op(*row) for row in _TABLE]
@@ -76,6 +82,18 @@ OP = {op.name: op.number for op in OPS}
 WITH_STEP = {"FLOOR": "FLOOR_TO", "CEIL": "CEIL_TO", "CHOP": "CHOP_TO", "ROUND": "ROUND_TO"}
 
 H_BASE, F_BASE, D_BASE = 0, 32, 64  # register codes are (file - 1) * 32 + index
+
+# The vector instructions work on 2 or 4 consecutive registers of one file.
+VECTOR_LANES = {"VADD2": 2, "VSUB2": 2, "VMUL2": 2, "VDIV2": 2, "VFMA2": 2,
+                "VMIN2": 2, "VMAX2": 2,
+                "VADD4": 4, "VSUB4": 4, "VMUL4": 4, "VDIV4": 4, "VFMA4": 4,
+                "VMIN4": 4, "VMAX4": 4}
+
+
+def group_fits(name, code):
+    """Whether a vector group of `lanes` registers starting at `code` stays
+    inside registers 0-31 of its file."""
+    return (code % 32) + VECTOR_LANES[name] <= 32
 
 
 def code_of(file_number, index):

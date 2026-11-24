@@ -6,7 +6,9 @@ from .isa import BY_NUMBER, decode, name_of
 
 _THREE = {"ADD", "SUB", "MUL", "DIV", "FMA", "REM", "MOD", "MIN", "MAX", "CPSGN", "SCALB", "NEXT",
           "LT", "LE", "EQ", "CMP", "SPLIT", "JOIN", "MANT",
-          "FLOOR_TO", "CEIL_TO", "CHOP_TO", "ROUND_TO"}
+          "FLOOR_TO", "CEIL_TO", "CHOP_TO", "ROUND_TO",
+          "VADD2", "VSUB2", "VMUL2", "VDIV2", "VFMA2", "VMIN2", "VMAX2",
+          "VADD4", "VSUB4", "VMUL4", "VDIV4", "VFMA4", "VMIN4", "VMAX4"}
 _TWO = {"MOV", "SQRT", "NEG", "ABS", "LOGB", "CLASS", "FLOOR", "CEIL", "CHOP", "ROUND"}
 _RELATION = {"BEQ", "BNE", "BLT", "BLE"}
 

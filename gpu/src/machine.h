@@ -67,8 +67,28 @@ enum : uint32_t {
     JAL = 68,
     JMP = 69,
     PUT = 70,
-    PUTC = 71
+    PUTC = 71,
+    VADD2 = 72,
+    VSUB2 = 73,
+    VMUL2 = 74,
+    VDIV2 = 75,
+    VFMA2 = 76,
+    VMIN2 = 77,
+    VMAX2 = 78,
+    VADD4 = 79,
+    VSUB4 = 80,
+    VMUL4 = 81,
+    VDIV4 = 82,
+    VFMA4 = 83,
+    VMIN4 = 84,
+    VMAX4 = 85
 };
+
+// The vector instructions work on 2 or 4 consecutive registers of one file.
+M1_HD inline uint32_t lanes_of(uint32_t op) {
+    return (op == VADD2 || op == VSUB2 || op == VMUL2 || op == VDIV2 || op == VFMA2
+            || op == VMIN2 || op == VMAX2) ? 2 : 4;
+}
 
 constexpr uint32_t NREG = 96;  // h0-h31 are 0-31, f0-f31 are 32-63, d0-d31 are 64-95
 
@@ -84,17 +104,19 @@ constexpr uint64_t range(uint32_t lo, uint32_t hi) {  // bits lo..hi, inclusive
 // place would overflow 64 bits and lose its top bits, which is exactly the
 // bug that made every opcode from BLT to PUTC look illegal.
 constexpr uint64_t VALID_LO = range(1, 2) | range(10, 16) | range(20, 45) | range(50, 53) | range(60, 63);
-constexpr uint64_t VALID_HI = range(0, 7);  // bit k is opcode 64 + k: 64 to 71
+constexpr uint64_t VALID_HI = range(0, 21);  // bit k is opcode 64 + k: 64 to 85
 constexpr uint64_t USED_A_LO = VALID_LO & ~(bit(NOP) | bit(HALT) | bit(BR));
 constexpr uint64_t USED_A_HI = VALID_HI;
 constexpr uint64_t USED_B_LO = bit(MOV) | bit(LD) | bit(ST) | bit(CVT) | range(15, 16) | range(20, 24) | bit(FMA) |
                                range(26, 40) | range(41, 44) | bit(MANT) | range(50, 53) | range(62, 63);
-constexpr uint64_t USED_B_HI = range(0, 1);  // BLT and BLE
+constexpr uint64_t USED_B_HI = range(0, 1) | range(8, 21);
+// BLT and BLE, then the vector instructions, 72 to 85
 constexpr uint64_t USED_C_LO = range(15, 16) | range(20, 23) | bit(FMA) | range(26, 29) | bit(CPSGN) | range(37, 40) |
                                bit(SCALB) | bit(NEXT) | range(50, 53) | bit(MANT);
-constexpr uint64_t USED_C_HI = 0;
+constexpr uint64_t USED_C_HI = range(8, 21);  // and their third
 constexpr uint64_t SAME_TYPE_LO = bit(MOV) | range(20, 40) | range(41, 44) | range(50, 53) | range(62, 63);
-constexpr uint64_t SAME_TYPE_HI = range(0, 1);  // BLT and BLE
+constexpr uint64_t SAME_TYPE_HI = range(0, 1) | range(8, 21);
+// BLT, BLE, and the vector instructions share their file
 
 M1_HD inline bool bitmap(uint64_t lo, uint64_t hi, uint32_t op) {
     return ((op < 64 ? lo >> op : hi >> (op - 64)) & 1) != 0;
@@ -206,7 +228,7 @@ M1_HD inline bool decode(uint64_t word, uint32_t& op, uint32_t& a, uint32_t& b, 
     if ((m << (64 - shift)) != 0) return false;  // not a whole number
     uint32_t n = (uint32_t)((m | (1ULL << 52)) >> shift);
     op = n / 1000000u;
-    if (op > 71 || !bitmap(VALID_LO, VALID_HI, op)) return false;
+    if (op > 85 || !bitmap(VALID_LO, VALID_HI, op)) return false;
     a = n / 10000u % 100u;
     b = n / 100u % 100u;
     c = n % 100u;
@@ -331,6 +353,41 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
             Result r = op_fma(fa, double_of(R[b]), double_of(R[d]), double_of(R[a]));
             c.flags |= r.flags;
             wr(a, r.value, 0);
+            M1_GO(next);
+        }
+
+        case VADD2: case VSUB2: case VMUL2: case VDIV2: case VMIN2: case VMAX2:
+        case VADD4: case VSUB4: case VMUL4: case VDIV4: case VMIN4: case VMAX4: {
+            uint32_t lanes = lanes_of(op);
+            if (((a & 31) + lanes > 32) || ((b & 31) + lanes > 32) || ((d & 31) + lanes > 32))
+                return fail(c, FAULT_ILLEGAL);  // a group runs past the end of its file
+            for (uint32_t lane = 0; lane < lanes; lane++) {
+                double x = double_of(R[b + lane]), y = double_of(R[d + lane]);
+                Result r;
+                switch (op) {
+                    case VADD2: case VADD4: r = op_add(fa, x, y); break;
+                    case VSUB2: case VSUB4: r = op_sub(fa, x, y); break;
+                    case VMUL2: case VMUL4: r = op_mul(fa, x, y); break;
+                    case VDIV2: case VDIV4: r = op_div(fa, x, y); break;
+                    case VMIN2: case VMIN4: r = op_min(fa, x, y); break;
+                    default: r = op_max(fa, x, y); break;
+                }
+                c.flags |= r.flags;
+                wr(a + lane, r.value, 0);
+            }
+            M1_GO(next);
+        }
+
+        case VFMA2: case VFMA4: {
+            uint32_t lanes = lanes_of(op);
+            if (((a & 31) + lanes > 32) || ((b & 31) + lanes > 32) || ((d & 31) + lanes > 32))
+                return fail(c, FAULT_ILLEGAL);
+            for (uint32_t lane = 0; lane < lanes; lane++) {
+                Result r = op_fma(fa, double_of(R[b + lane]), double_of(R[d + lane]),
+                                  double_of(R[a + lane]));
+                c.flags |= r.flags;
+                wr(a + lane, r.value, 0);
+            }
             M1_GO(next);
         }
 

@@ -16,7 +16,7 @@ from array import array
 from dataclasses import dataclass
 
 from . import fp
-from .isa import BY_NAME, WITH_STEP, code_of, encode
+from .isa import VECTOR_LANES, BY_NAME, WITH_STEP, code_of, encode
 
 FORMAT_BY_SUFFIX = {"H": fp.H, "F": fp.F, "D": fp.D}
 KIND_BY_FILE = {1: "half", 2: "float", 3: "double"}
@@ -26,7 +26,9 @@ PREDEFINED = {"inf": fp.INF, "nan": fp.NAN}
 # Operand kinds.  R: a register.  A: a float register holding an address.
 # M: "[fN]".  E: a number or label expression, which becomes an inline operand.
 # An instruction with several forms takes the one with the right number of operands.
-_SAME3 = "ADD SUB MUL DIV FMA REM MOD MIN MAX CPSGN SCALB NEXT LT LE EQ CMP".split()
+_SAME3 = ("ADD SUB MUL DIV FMA REM MOD MIN MAX CPSGN SCALB NEXT LT LE EQ CMP "
+          "VADD2 VSUB2 VMUL2 VDIV2 VFMA2 VMIN2 VMAX2 "
+          "VADD4 VSUB4 VMUL4 VDIV4 VFMA4 VMIN4 VMAX4").split()
 FORMS = {
     "HALT": [""], "NOP": [""],
     "MOV": ["RR"], "LDI": ["RE"], "LD": ["RM"], "ST": ["MR"], "CVT": ["RR"],
@@ -43,7 +45,7 @@ for _name in _SAME3:
 STEP_FORMS = {"FLOOR": "FLOOR_TO", "CEIL": "CEIL_TO", "CHOP": "CHOP_TO", "ROUND": "ROUND_TO"}
 
 _LABEL = re.compile(r"\s*([A-Za-z_]\w*)\s*:")
-_STATEMENT = re.compile(r"([A-Za-z]+)(?:\.([A-Za-z]+))?\s*(.*)$")
+_STATEMENT = re.compile(r"([A-Za-z][A-Za-z0-9]*)(?:\.([A-Za-z]+))?\s*(.*)$")
 _REGISTER = re.compile(r"([hfd])(\d{1,2})")
 _MEMORY = re.compile(r"\[\s*([A-Za-z_]\w*)\s*\]")
 _TOKEN = re.compile(r"[+\-]|[A-Za-z_]\w*|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
@@ -291,6 +293,13 @@ class _Assembler:
         if self.start is None:
             self.start = float(self.here())
         fields = [code_of(*register) for register in registers] + [0] * (3 - len(registers))
+        lanes = VECTOR_LANES.get(spec.name)
+        if lanes is not None:
+            for file_number, index in registers:
+                if index + lanes > 32:
+                    raise AsmError(lineno, f"{spec.name} needs {lanes} registers from "
+                                           f"{_register_name(file_number, index)} onwards, and the "
+                                           f"{KIND_BY_FILE[file_number]} file only reaches 31")
         self.cells.extend(fp.pack(fp.D, float(encode(spec.number, *fields))))
         for items in expressions:
             self.value(fp.D, items, lineno, "value" if spec.name == "LDI" else "target",

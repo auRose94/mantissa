@@ -16,7 +16,7 @@ the operation covers the group.  `VADD4 d8, d16, d24` is
 
 The machine already thinks in vectors of a sort -- memory is a row of cells,
 arrays are runs of doubles, and the game's pixel machines are the fleet form
-of the same idea.  What is missing is doing four of them with one fetch and
+of the same idea.  What was missing is doing four of them with one fetch and
 one decode.
 
     opcode  operation                      lanes
@@ -25,22 +25,15 @@ one decode.
     74      VMUL2 rd, ra, rb
     75      VDIV2 rd, ra, rb
     76      VFMA2 rd, ra, rb               rd..rd+1 = ra..ra+1 * rb..rb+1 + rd..rd+1
-    77      VMIN2 rd, ra, rb      (also VMAX2)
-    78      VADD4 rd, ra, rb
-    79      VSUB4 rd, ra, rb
-    80      VMUL4 rd, ra, rb
-    81      VDIV4 rd, ra, rb
-    82      VFMA4 rd, ra, rb
-    83      VMIN4 rd, ra, rb      (also VMAX4)
-    84      VCVT4  rd, ra               four narrow values widened, and back
-    85      VSPLIT4 rd, ra, rb, rc?     no: the operand fields are three; the
-                                        split pair pattern applies per lane
-
-Rules: all three groups must sit inside one register file and not run past
-register 31 of that file; the result may overlap a source.  Everything else
-(the type rules, the flags, the NaN discipline) is per lane, exactly as the
-scalar instruction does it.  No new state: a program that ignores these
-instructions cannot tell they exist.
+    77      VMIN2 rd, ra, rb
+    78      VMAX2 rd, ra, rb
+    79      VADD4 rd, ra, rb
+    80      VSUB4 rd, ra, rb
+    81      VMUL4 rd, ra, rb
+    82      VDIV4 rd, ra, rb
+    83      VFMA4 rd, ra, rb               rd..rd+3 = ra..ra+3 * rb..rb+3 + rd..rd+3
+    84      VMIN4 rd, ra, rb
+    85      VMAX4 rd, ra, rb
 
 What it buys, honestly:
 
