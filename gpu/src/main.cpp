@@ -40,6 +40,7 @@ namespace {
 int usage() {
     std::fprintf(stderr, "usage: mantissa-gpu cosim TRACE.trace [--out OUT.trace] [--steps N] [--panel]\n"
                          "       mantissa-gpu array JOB.bin [--out RESULT.bin]\n"
+                         "       mantissa-gpu sim TRACE.trace [--steps N] [--out OUT.trace]\n"
                          "       mantissa-gpu info\n");
     return 1;
 }
@@ -445,12 +446,94 @@ int info() {
     return 0;
 }
 
+// --- sim: the machine, on the host, at full speed -----------------------------------
+// The same machine.h the GPU kernel runs, compiled for the host only: no HIP
+// launch, no tracing unless asked.  This is the fast single-machine simulator.
+
+int sim(int argc, char** argv) {
+    if (argc < 3) return usage();
+    long long steps_arg = -1;
+    bool write_trace = false;
+    std::string out_path, in_path = argv[2];
+    for (int i = 3; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--steps") && i + 1 < argc) steps_arg = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "--out") && i + 1 < argc) { out_path = argv[++i]; write_trace = true; }
+        else return usage();
+    }
+    Image image;
+    std::string header;
+    std::vector<std::string> reference;
+    bool has_run;
+    if (!read_trace(in_path, image, header, reference, has_run)) return 2;
+    uint64_t steps = (uint64_t)std::max(0LL, steps_arg);
+    if (steps_arg < 0 && has_run) {
+        for (const std::string& line : reference)
+            if (line.compare(0, 2, "S ") == 0) steps++;
+    }
+
+    std::vector<uint8_t> memory(2 * (size_t)image.cells, 0);
+    for (size_t k = 0; k < image.data.size(); k++) {
+        memory[2 * k] = (uint8_t)(image.data[k] & 0xFF);
+        memory[2 * k + 1] = (uint8_t)(image.data[k] >> 8);
+    }
+    m1::Ctx c;
+    std::vector<uint64_t> regs(m1::NREG), before(m1::NREG);
+    std::vector<uint32_t> tags(m1::NREG), before_tags(m1::NREG);
+    c.regs = regs.data();
+    c.tags = tags.data();
+    c.mem = memory.data();
+    c.size = image.cells;
+    m1::reset(c, image.entry, image.sp);
+
+    std::vector<m1::Event> events;
+    m1::Sink sink{nullptr, 0, 0, false};
+    if (write_trace) {
+        events.resize(steps * 3 + 16);
+        sink.out = events.data();
+        sink.capacity = (uint32_t)events.size();
+    }
+    auto began = std::chrono::steady_clock::now();
+    if (write_trace) m1::run<true>(c, steps, &sink, before.data(), before_tags.data());
+    else m1::run<false>(c, steps, nullptr, before.data(), before_tags.data());
+    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+
+    if (write_trace) {
+        std::FILE* out = std::fopen(out_path.c_str(), "w");
+        if (!out) return 2;
+        std::fprintf(out, "%srun\n", header.c_str());
+        for (uint32_t k = 0; k < sink.count; k++) {
+            const m1::Event& e = events[k];
+            if (e.kind == m1::E_STEP) std::fprintf(out, "S %u %u\n", e.step, e.pc);
+            else if (e.kind == m1::E_REG) std::fprintf(out, "R %u %u %c%u %s\n", e.step, e.pc,
+                                                       "hfd"[e.c >> 5], e.c & 31, hex64(e.d).c_str());
+            else if (e.kind == m1::E_STORE) std::fprintf(out, "M %u %u %u %u %s\n", e.step, e.pc,
+                                                         e.c >> 8, e.c & 255, hex64(e.d).c_str());
+            else if (e.kind == m1::E_PUT) std::fprintf(out, "P %u %u %s\n", e.step, e.pc, hex64(e.d).c_str());
+            else if (e.kind == m1::E_PUTC) std::fprintf(out, "C %u %u %u\n", e.step, e.pc, e.c);
+            else if (e.kind == m1::E_NOTHING) std::fprintf(out, "X %u %u\n", e.step, e.pc);
+            else break;
+        }
+        if (c.status == m1::HALTED) std::fprintf(out, "H\n");
+        else if (c.status == m1::FAULTED) std::fprintf(out, "F %s\n", m1::FAULT_NAMES[c.fault]);
+        else std::fprintf(out, "L\n");
+        std::fclose(out);
+    }
+    if (sink.overflowed)
+        std::fprintf(stderr, "sim: the trace buffer was too small; the written trace is truncated\n");
+    const char* ends = c.status == m1::HALTED ? "halted" : c.status == m1::FAULTED ? "faulted" : "at the step limit";
+    std::printf("sim %s: %llu steps on the host in %.3f s (%.0f instructions a second), %s\n",
+                in_path.c_str(), (unsigned long long)c.steps, seconds,
+                seconds > 0 ? (double)c.steps / seconds : 0.0, ends);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
     if (!std::strcmp(argv[1], "cosim")) return cosim(argc, argv);
     if (!std::strcmp(argv[1], "array")) return array(argc, argv);
+    if (!std::strcmp(argv[1], "sim")) return sim(argc, argv);
     if (!std::strcmp(argv[1], "info")) return info();
     return usage();
 }

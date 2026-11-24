@@ -261,5 +261,12 @@ port must reproduce is the value.
 
     mantissa/   fp, isa, memory, machine, asm, disasm, trace, and the command line
     programs/   the demos, and the Mandelbrot zoom tour
+    compiler/   m4c.py: a compiler for a small float-only language
+    gpu/        the HIP port: cosim, sim (60M instructions a second on the host),
+                array mode, and Mantissa Dodge
+    fpga/       the soft core: Verilator-verified, Yosys-elaborated, fuzzed
     tests/      the arithmetic against exact arithmetic, then everything else
     golden/     recorded runs for other implementations to replay; see PORTS.md
+    EXTENSIONS.md  SIMD, a screen device, optimisation patterns, and the road
+
+The name is Mantissa.  It stuck.
