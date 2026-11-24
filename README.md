@@ -269,7 +269,7 @@ port must reproduce is the value.
 
     mantissa/   fp, isa, memory, machine, asm, disasm, trace, and the command line
     programs/   the demos, and the Mandelbrot zoom tour
-    compiler/   m4c.py: a compiler for a small float-only language
+    compiler/   m4c.py: a compiler for a small float-only language, arrays included
     gpu/        the HIP port: cosim, sim (60M instructions a second on the host),
                 array mode, and Mantissa Dodge
     fpga/       the soft core: Verilator-verified, Yosys-elaborated, fuzzed
