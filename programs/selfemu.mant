@@ -1,0 +1,424 @@
+; selfemu.mant -- a Mantissa-1 interpreter written in Mantissa-1 assembly.
+;
+;     python -m mantissa run programs/selfemu.mant
+;
+; The interpreted machine's program sits below the label `target`, in this
+; same memory: the interpreter fetches it with LD, and the target's own
+; loads and stores address the same cells, so a target ST writes where the
+; interpreter will next fetch.  Self-modifying targets work, uncached.  The
+; target ends at its HALT (opcode 02); zeroed memory decodes to opcode 00,
+; so a target that falls off its end stops the interpreter instead of
+; wandering into the interpreter's own code.
+;
+; The interpreted machine's 96 registers are 96 doubles at `regs`, one per
+; register code (h0 is code 0, f0 is 32, d0 is 64), every value widened to
+; double.  This is what keeps the types honest: before arithmetic, both
+; operands are narrowed to their own format with one CVT, the operation
+; runs in that format, and the result is widened again -- one rounding, in
+; the target's type, exactly as the machine rounds.  A stored value is
+; always the exact widening of what its format holds, so the narrow and
+; widen around a load, a store, a MOV or an LDI never change a bit.
+;
+; Fetch and decode: the instruction number is taken apart with chop and
+; mod -- the opcode, its two decimal digits (class, then unit), and the
+; three operand fields.  Dispatch is two compare chains.  A pc outside
+; [target, end) or off a four-cell boundary, an unknown opcode, or an
+; operand field over 95 stops the interpreter with its own HALT: a
+; finishing target and a faulting one look the same from the console.
+; Target PUTC of a non-character faults the interpreter's own PUTC, which
+; ends the run the same way the reference ends the target.  The type rules
+; (ADD of one file, CVT of two) are not re-checked; the assembler refuses
+; such targets before they ever get here.
+;
+; Covered, in any mix of the three types: NOP HALT MOV LDI LD ST ADD SUB
+; MUL DIV, BR BSGN BEQ BNE BLT BLE BZ BNZ JAL JMP, PUT PUTC -- enough for
+; straight-line code, loops, branches and subroutine calls.  Anything else
+; (CVT SPLIT JOIN, the remaining arithmetic, the vectors) stops the
+; interpreter if a target uses it.
+;
+; The interpreter's own registers, by nickname:
+;
+;   f0 pc      f1 target base   f2 end bound    f3 register-file base
+;   f4..f8     the constants 4, 8, 12, 32, 64
+;   f9..f11    the arithmetic dispatch tables (half, float, double)
+;   f12, f13   address working      f14 table base     f17 jump temp
+;   f15, f16, f18  operand fields a, b and c, as floats
+;   f20..f22   float working        f23 the arithst address, for the tables
+;   h0..h3     half working
+;   d0         the fetched instruction number
+;   d1..d5     opcode, fields a b c, unit digit
+;   d6..d9     operand values and decode temps
+;   d10..d25   the constants 10, 1..9, 0, 1e6, 100, 95, 20, 1e4
+;
+; A name like h0 in the target below is the interpreted machine's h0, not
+; the interpreter's.  tests/test_selfemu.py splices other targets in at the
+; `target` line and compares them value for value against the reference.
+; Measured, interpreted steps per direct step: 41 to 48 times over seven
+; targets -- fetch, decode and dispatch run about 30 instructions before a
+; handler starts, which came in well under the traditional few hundred.
+; The table is in EXTENSIONS.md.
+
+; -- the interpreter ---------------------------------------------------------
+
+main:   LDI.F  f0, target         ; the interpreted pc
+        LDI.F  f1, target
+        LDI.F  f2, end
+        LDI.F  f3, regs
+        LDI.F  f9, opstab_h
+        LDI.F  f10, opstab_f
+        LDI.F  f11, opstab_d
+        LDI.F  f23, arithst      ; the tables jump back through it
+        LDI.F  f4, 4
+        LDI.F  f5, 8
+        LDI.F  f6, 12
+        LDI.F  f7, 32
+        LDI.F  f8, 64
+        LDI.D  d10, 10
+        LDI.D  d11, 1
+        LDI.D  d12, 2
+        LDI.D  d13, 3
+        LDI.D  d14, 4
+        LDI.D  d15, 5
+        LDI.D  d16, 6
+        LDI.D  d17, 7
+        LDI.D  d18, 8
+        LDI.D  d19, 9
+        LDI.D  d20, 0
+        LDI.D  d21, 1000000
+        LDI.D  d22, 100
+        LDI.D  d23, 95
+        LDI.D  d24, 20
+        LDI.D  d25, 10000
+
+; -- fetch: the pc must sit inside the target, whole and on a four-cell line
+
+loop:   BLT.F  f0, f1, stop
+        BLT.F  f2, f0, stop
+        CVT.D  d9, f0
+        MOD.D  d9, d9, d14
+        BZ.D   d9, fetch
+        BR     stop
+fetch:  LD.D   d0, [f0]
+
+; -- decode: opcode, its two digits, the three operand fields
+
+        DIV.D  d9, d0, d21
+        CHOP.D d1, d9             ; the opcode
+        MOD.D  d5, d1, d10        ; its unit digit
+        DIV.D  d9, d1, d10
+        CHOP.D d9, d9             ; its class digit
+        DIV.D  d6, d0, d25
+        CHOP.D d6, d6
+        MOD.D  d2, d6, d22        ; field a
+        DIV.D  d6, d0, d22
+        CHOP.D d6, d6
+        MOD.D  d3, d6, d22        ; field b
+        MOD.D  d4, d0, d22        ; field c
+        CVT.F  f15, d2
+        CVT.F  f16, d3
+        CVT.F  f18, d4
+        MAX.D  d6, d2, d3
+        MAX.D  d6, d6, d4
+        SUB.D  d6, d23, d6
+        BSGN.D d6, stop, dispatch ; a field over 95 names no register
+
+; -- dispatch: class first, then unit
+
+dispatch:
+        BEQ.D  d9, d20, cls0
+        BEQ.D  d9, d11, cls1
+        BEQ.D  d9, d12, cls2
+        BEQ.D  d9, d16, cls6
+        BEQ.D  d9, d17, cls7
+        BR     stop
+cls0:   BEQ.D  d5, d12, stop      ; HALT: the target is done
+        BEQ.D  d5, d11, nopdo     ; NOP
+        BR     stop
+cls1:   BEQ.D  d5, d20, domov     ; MOV
+        BEQ.D  d5, d11, doldi     ; LDI
+        BEQ.D  d5, d12, dold      ; LD
+        BEQ.D  d5, d13, dost      ; ST
+        BR     stop
+cls2:   BEQ.D  d5, d20, doarith   ; ADD
+        BEQ.D  d5, d11, doarith   ; SUB
+        BEQ.D  d5, d12, doarith   ; MUL
+        BEQ.D  d5, d13, doarith   ; DIV
+        BR     stop
+cls6:   BEQ.D  d5, d20, brtaken   ; BR
+        BEQ.D  d5, d11, dobsgn    ; BSGN
+        BEQ.D  d5, d12, dobeq     ; BEQ
+        BEQ.D  d5, d13, dobne     ; BNE
+        BEQ.D  d5, d14, doblt     ; BLT
+        BEQ.D  d5, d15, doble     ; BLE
+        BEQ.D  d5, d16, dobz      ; BZ
+        BEQ.D  d5, d17, dobnz     ; BNZ
+        BEQ.D  d5, d18, dojal     ; JAL
+        BEQ.D  d5, d19, dojmp     ; JMP
+        BR     stop
+cls7:   BEQ.D  d5, d20, doput     ; PUT
+        BEQ.D  d5, d11, doputc    ; PUTC
+        BR     stop
+
+; -- arithmetic: narrow both operands to the target's own type, operate,
+;    widen back.  The tables below carry the four operations, one per type.
+
+doarith:
+        MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3       ; the address of register a, which takes the answer
+        MUL.F  f13, f16, f4
+        ADD.F  f13, f13, f3
+        LD.D   d6, [f13]          ; register b, the left operand
+        MUL.F  f13, f18, f4
+        ADD.F  f13, f13, f3
+        LD.D   d7, [f13]          ; register c, the right operand
+        BLT.F  f15, f7, arithh
+        BLT.F  f15, f8, arithf
+        MOV.F  f14, f11           ; doubles need no narrowing
+        BR     arithgo
+arithh: CVT.H  h1, d6
+        CVT.H  h2, d7
+        MOV.F  f14, f9
+        BR     arithgo
+arithf: CVT.F  f20, d6
+        CVT.F  f21, d7
+        MOV.F  f14, f10
+arithgo:
+        SUB.D  d9, d1, d24        ; which of the four, as 0 to 3
+        CVT.F  f17, d9
+        MUL.F  f17, f17, f6
+        ADD.F  f17, f17, f14
+        JMP    f17
+arithst:
+        ST.D   [f12], d8
+        BR     next4
+
+opstab_h:
+        ADD.H  h3, h1, h2
+        CVT.D  d8, h3
+        JMP    f23
+        SUB.H  h3, h1, h2
+        CVT.D  d8, h3
+        JMP    f23
+        MUL.H  h3, h1, h2
+        CVT.D  d8, h3
+        JMP    f23
+        DIV.H  h3, h1, h2
+        CVT.D  d8, h3
+        JMP    f23
+opstab_f:
+        ADD.F  f22, f20, f21
+        CVT.D  d8, f22
+        JMP    f23
+        SUB.F  f22, f20, f21
+        CVT.D  d8, f22
+        JMP    f23
+        MUL.F  f22, f20, f21
+        CVT.D  d8, f22
+        JMP    f23
+        DIV.F  f22, f20, f21
+        CVT.D  d8, f22
+        JMP    f23
+opstab_d:
+        ADD.D  d8, d6, d7
+        NOP
+        JMP    f23
+        SUB.D  d8, d6, d7
+        NOP
+        JMP    f23
+        MUL.D  d8, d6, d7
+        NOP
+        JMP    f23
+        DIV.D  d8, d6, d7
+        NOP
+        JMP    f23
+
+; -- moves and memory --------------------------------------------------------
+
+domov:  MUL.F  f12, f16, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        ST.D   [f12], d6
+        BR     next4
+
+doldi:  ADD.F  f17, f0, f4
+        LD.D   d6, [f17]          ; the inline operand
+        BLT.F  f15, f7, ldih
+        BLT.F  f15, f8, ldif
+        BR     ldist
+ldih:   CVT.H  h0, d6             ; rounded once, to the register's own type
+        CVT.D  d6, h0
+        BR     ldist
+ldif:   CVT.F  f20, d6
+        CVT.D  d6, f20
+ldist:  MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        ST.D   [f12], d6
+        ADD.F  f0, f0, f5         ; LDI is eight cells
+        BR     loop
+
+dold:   MUL.F  f13, f16, f4       ; field b holds the address
+        ADD.F  f13, f13, f3
+        LD.D   d6, [f13]
+        CVT.F  f13, d6
+        BLT.F  f15, f7, ldh
+        BLT.F  f15, f8, ldf
+        LD.D   d8, [f13]
+        BR     ldst
+ldf:    LD.F   f20, [f13]
+        CVT.D  d8, f20
+        BR     ldst
+ldh:    LD.H   h0, [f13]
+        CVT.D  d8, h0
+ldst:   MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        ST.D   [f12], d8
+        BR     next4
+
+dost:   MUL.F  f13, f15, f4       ; field a holds the address
+        ADD.F  f13, f13, f3
+        LD.D   d6, [f13]
+        CVT.F  f13, d6
+        MUL.F  f12, f16, f4       ; field b holds the value
+        ADD.F  f12, f12, f3
+        LD.D   d7, [f12]
+        BLT.F  f16, f7, sth
+        BLT.F  f16, f8, stf
+        ST.D   [f13], d7
+        BR     next4
+stf:    CVT.F  f20, d7
+        ST.F   [f13], f20
+        BR     next4
+sth:    CVT.H  h0, d7
+        ST.H   [f13], h0
+        BR     next4
+
+; -- output: the interpreter performs the target's PUT and PUTC itself,
+;    handing over the same widened value the reference would ---------------
+
+doput:  MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        PUT.D  d6
+        BR     next4
+doputc: MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        PUTC.D d6
+        BR     next4
+
+; -- branches: taken lands on the inline operand, not taken skips it -------
+
+brtaken:
+        ADD.F  f17, f0, f4
+        LD.D   d6, [f17]
+        CVT.F  f0, d6
+        BR     loop
+brfall: ADD.F  f0, f0, f5
+        BR     loop
+
+dobz:   MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        BZ.D   d6, brtaken
+        BR     brfall
+dobnz:  MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        BNZ.D  d6, brtaken
+        BR     brfall
+dobeq:  MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        MUL.F  f13, f16, f4
+        ADD.F  f13, f13, f3
+        LD.D   d7, [f13]
+        BEQ.D  d6, d7, brtaken
+        BR     brfall
+dobne:  MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        MUL.F  f13, f16, f4
+        ADD.F  f13, f13, f3
+        LD.D   d7, [f13]
+        BNE.D  d6, d7, brtaken
+        BR     brfall
+doblt:  MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        MUL.F  f13, f16, f4
+        ADD.F  f13, f13, f3
+        LD.D   d7, [f13]
+        BLT.D  d6, d7, brtaken
+        BR     brfall
+doble:  MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        MUL.F  f13, f16, f4
+        ADD.F  f13, f13, f3
+        LD.D   d7, [f13]
+        BLE.D  d6, d7, brtaken
+        BR     brfall
+dobsgn: MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        BSGN.D d6, bsgneg, bsgpos
+        ADD.F  f0, f0, f6         ; zero (or NaN): twelve cells on
+        BR     loop
+bsgneg: ADD.F  f17, f0, f4
+        LD.D   d6, [f17]
+        CVT.F  f0, d6
+        BR     loop
+bsgpos: ADD.F  f17, f0, f5
+        LD.D   d6, [f17]
+        CVT.F  f0, d6
+        BR     loop
+
+; -- jumps --------------------------------------------------------------------
+
+dojmp:  MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        LD.D   d6, [f12]
+        CVT.F  f0, d6
+        BR     loop
+dojal:  ADD.F  f17, f0, f5        ; the machine leaves pc + 8 behind
+        CVT.D  d8, f17
+        MUL.F  f12, f15, f4
+        ADD.F  f12, f12, f3
+        ST.D   [f12], d8
+        ADD.F  f17, f0, f4
+        LD.D   d6, [f17]
+        CVT.F  f0, d6
+        BR     loop
+
+; -- the rest ------------------------------------------------------------------
+
+nopdo:  BR     next4
+next4:  ADD.F  f0, f0, f4
+        BR     loop
+stop:   HALT                     ; the target halted, or misbehaved
+
+; -- the interpreted machine's register file -----------------------------------
+
+regs:   SPACE 384                ; 96 doubles, one per register code
+
+; -- the target program --------------------------------------------------------
+; Spliced out and replaced by tests/test_selfemu.py; run directly it prints
+; what the interpreter prints when the whole file runs.
+
+target:
+t_start:
+        LDI.F  f0, t_msg
+        LDI.F  f1, 1
+t_again:
+        LD.H   h0, [f0]
+        BZ.H   h0, t_done
+        PUTC.H h0
+        ADD.F  f0, f0, f1
+        BR     t_again
+t_done:
+        HALT
+t_msg:  TEXT "a machine interpreting its own machine\n"
+        DATA.H 0
+end:

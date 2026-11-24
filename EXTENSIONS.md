@@ -122,7 +122,60 @@ The road from here, in order of value:
    decide format), `MOV` elision across assignments, branch to branch.
 4. **Vector intrinsics**: `vadd(a, b)` maps one source line to one `VADD4`.
 
-## Self-programming, intelligence, and how far this goes
+## The self-interpreter: `programs/selfemu.mant`
+
+The machine interpreting itself, in hand assembly -- the self-emulation the
+next section extrapolates, built.  The target program sits in the
+interpreter's own memory, between the
+labels `target` and `end`, and its loads and stores address that memory
+directly, so a self-modifying target works without doing anything about it.
+The interpreter walks it: fetch the instruction number with `LD`, chop and
+mod it into opcode, operand fields and two dispatch digits, compare-chain
+through class and unit, and perform the effect.
+
+- **The register file** is 96 doubles at `regs`, one per register code,
+  every value widened.  Honesty about types is one CVT pair: before
+  arithmetic both operands are narrowed to the target's own format, the
+  operation runs there, and the result is widened back -- one rounding, in
+  the target's type, which is the machine's rounding.  Loads, stores, MOV
+  and LDI round only where the machine does, because a stored value is
+  always the exact widening of its format.
+- **PUT and PUTC** of the target are performed by the interpreter's own
+  PUT and PUTC of the same widened value; the console sees identical bits,
+  so the comparison against the reference is exact.
+- **Coverage**, in any mix of the three types: NOP HALT MOV LDI LD ST ADD
+  SUB MUL DIV, BR BSGN BEQ BNE BLT BLE BZ BNZ JAL JMP, PUT PUTC.  Anything
+  else stops the interpreter if a target uses it.
+- **Faults**: a pc off `[target, end)` or off a four-cell line, an unknown
+  opcode, or an operand field over 95 stops the interpreter with its own
+  HALT.  A finishing target and a faulting one are indistinguishable from
+  the console -- the reference keeps them apart, and the tests use legal
+  targets.  The type rules are not re-checked; the assembler refuses such
+  targets first.
+
+`tests/test_selfemu.py` runs seven targets both ways -- directly, and
+spliced in at the `target` line -- and compares the console output value
+for value, both runs ending in HALT.  Measured slowdown, interpreted steps
+per direct step:
+
+| target | direct steps | interpreted | slowdown |
+|---|---|---|---|
+| demo string printer | 200 | 8,531 | 42.7x |
+| hello string | 240 | 10,235 | 42.6x |
+| counting loop | 56 | 2,692 | 48.1x |
+| branch tour | 30 | 1,241 | 41.4x |
+| load/store round trip | 23 | 976 | 42.4x |
+| subroutine, BSGN | 28 | 1,158 | 41.4x |
+| rounding in half and float | 20 | 882 | 44.1x |
+
+About 40 to 50 times, not the traditional few hundred: one target step costs
+roughly 30 instructions of fetch, decode and dispatch plus a handful in the
+handler, and nothing here emulates what is already the same machine.  The
+natural next rungs are the conversions this subset leaves out -- CVT, SPLIT
+and JOIN are dispatch entries, not inventions -- and a compiler that emits
+this style of interpreter around a larger subset.
+
+
 
 The machine's programs are numbers, and it can write them: `smc_emit.mant`
 is a program that writes programs.  The honest extrapolations, in order of
