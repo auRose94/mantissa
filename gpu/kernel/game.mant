@@ -1,0 +1,46 @@
+; game.mant -- the two programs of Mantissa Dodge, as documentation.
+;
+; python3 gpu/python/make_game.py builds these (see its PROGRAM strings for
+; the authoritative text, with the data addresses computed from the assembled
+; size); gpu/python/run_game.py drives them, a frame at a time:
+;
+;     1. patch the frame number, the player's x, alive and score into the
+;        referee machine and run it: it advances the obstacles (their z is a
+;        MOD of the frame number, so no state is needed), tests the player
+;        against each lane with ABS, LT and MUL-as-AND, freezes the score on
+;        a hit, and writes the obstacle positions for the pixel machines;
+;     2. patch the player and the obstacles into every pixel machine and run
+;        them: each one casts its own ray (SQRT to normalise), finds the
+;        checkerboard floor (CHOP, MOD) and the nearest of four spheres (the
+;        quadratic formula), and stores the colour as one packed double,
+;         r*65536 + g*256 + b
+;        -- exact in every format, and just under the float wall;
+;     3. the console decodes the colours into a picture and carries alive and
+;        score to the next frame.
+;
+; The pixel program's blocks, in order:
+;
+; ; the ray
+;         LDI.F  f1, {col}
+;         LD.D   d0, [f1]
+;         ...                  col and row become u, v, then
+;         SQRT.D d5, d5        the length of (u, v, 1)
+;         DIV.D  d6, d0, d5    rd x
+;         DIV.D  d7, d1, d5    rd y
+;         DIV.D  d8, d4, d5    rd z
+; ; the floor, y = -1, is a candidate if the ray points down
+;         BLT.D  d7, d11, floor_yes
+; ; its colour: (floor(hx) + floor(hz)) mod 2 picks light or dark
+;         CHOP.D d11, d13
+;         CHOP.D d0, d0
+;         MOD.D  d11, d11, d0
+; ; each ball: the quadratic formula
+;         SUB.D  d2, d2, d1    disc = b*b - cc
+;         SQRT.D d2, d2
+;         SUB.D  d3, d3, d2    t = -b - sqrt(disc)
+;         BLE.D  d3, d9, nearer
+; ; and the winner writes the packed colour and halts
+;         ST.D   [f5], d10
+;         HALT
+;
+; Everything a picture needs, out of sign, exponent and significand.

@@ -1,0 +1,42 @@
+; mandel_pixel.mant -- one pixel of the Mandelbrot set.
+;
+; The array mode runs many copies of this program at once, one machine per
+; pixel, every one with its own private memory.  The host patches each
+; machine's cx and cy (cells CX and CY, doubles) before it runs; the machine
+; iterates z = z*z + c until it escapes or reaches the cap (cell CAP), and
+; stores the count at OUT.
+;
+;         LDI.F  f1, CX
+;         LDI.F  f2, CY
+;         LD.D   d0, [f1]         ; cx
+;         LD.D   d1, [f2]         ; cy
+;         LD.D   d2, [f3]         ; the cap, a plain value of the image
+;         LDI.D  d3, 0            ; zx
+;         LDI.D  d4, 0            ; zy
+;         LDI.D  d5, 0            ; n
+;         LDI.D  d6, 4            ; escape radius, squared
+;         LDI.D  d7, 1
+;         LDI.D  d13, 2
+; loop:   MUL.D  d8, d3, d3       ; zx * zx
+;         MUL.D  d9, d4, d4       ; zy * zy
+;         ADD.D  d10, d8, d9
+;         BLE.D  d6, d10, escaped ; |z| >= 2
+;         BLE.D  d2, d5, escaped  ; n >= cap
+;         SUB.D  d11, d8, d9      ; zx*zx - zy*zy
+;         MUL.D  d12, d3, d4
+;         MUL.D  d12, d12, d13    ; 2 * zx * zy
+;         ADD.D  d4, d12, d1      ; zy = 2*zx*zy + cy
+;         ADD.D  d3, d11, d0      ; zx = zx*zx - zy*zy + cx
+;         ADD.D  d5, d5, d7
+;         BR     loop
+; escaped:
+;         ST.D   [f4], d5         ; the count, the cap if it never escaped
+;         HALT
+;
+; This file is documentation: make_job.py builds the same program with its
+; own copy of these instructions, because the CX, CY, CAP and OUT addresses
+; have to agree with the memory layout the job builder chooses.  Keep the two
+; in step.
+
+CX:  equ 160
+CY:  equ 164
