@@ -40,8 +40,17 @@ What it buys, honestly:
 - **FPGA**: four lanes through four FPUs -- the one place it is a real
   hardware win, and the reason to build it.
 - **HIP**: the interpreter executes four scalar ops; the fleet is already the
-  vector unit (1,536 machines are a 1,536-lane SIMD).
+  vector unit (1,536 machines are a 1,536-lane SIMD).  Measured: the vector
+  Mandelbrot (`gpu/python/mandel_vector.py`) renders the same picture as the
+  scalar one from 4 times fewer machines with about 4 percent more total
+  instructions -- on the fleet, SIMD buys machine count, not speed.  The
+  fetch-and-decode savings are real on CPUs and the FPGA core.
 - **Reference**: four calls to the same arithmetic, verified the same way.
+- **The predicate trap**: an escaped Mandelbrot lane never returns, so the
+  fresh predicate needs no frozen copy -- but it must be computed from the
+  distance BEFORE the lanes are updated, and the natural scratch block is
+  also where the next iteration's products want to live.  The ordering is
+  the whole game; `gpu/python/mandel_vector.py` documents the working one.
 
 ## The screen: a framebuffer device
 
