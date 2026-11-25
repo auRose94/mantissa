@@ -61,7 +61,8 @@ int main(int argc, char** argv) {
   dut->rst_n = 0;
   dut->start = 0;
   dut->op = 0; dut->fmt = 0; dut->fmt2 = 0; dut->sel = 0;
-  dut->a = 0; dut->b = 0; dut->c = 0;
+  dut->a[0] = 0; dut->a[1] = 0; dut->a[2] = 0; dut->a[3] = 0;
+  dut->b = 0; dut->c = 0;
   auto tick = [&]() { dut->clk = 0; dut->eval(); dut->clk = 1; dut->eval(); };
   tick(); tick();
   dut->rst_n = 1;
@@ -80,7 +81,14 @@ int main(int argc, char** argv) {
     dut->fmt = std::strtoul(v[1].c_str(), nullptr, 10);
     dut->fmt2 = std::strtoul(v[2].c_str(), nullptr, 10);
     dut->sel = std::strtoul(v[3].c_str(), nullptr, 10);
-    dut->a = unhex(v[4]); dut->b = unhex(v[5]); dut->c = unhex(v[6]);
+    // operand a and the answer are 128 bits at the interface: the narrow
+    // formats live in the low 64, which is all the vectors ever use
+    const uint64_t a_bits = unhex(v[4]);
+    dut->a[0] = static_cast<uint32_t>(a_bits);
+    dut->a[1] = static_cast<uint32_t>(a_bits >> 32);
+    dut->a[2] = 0;
+    dut->a[3] = 0;
+    dut->b = unhex(v[5]); dut->c = unhex(v[6]);
     const uint64_t want_y = unhex(v[7]), want_y2 = unhex(v[8]);
     const unsigned want_flags = static_cast<unsigned>(std::strtoul(v[9].c_str(), nullptr, 16));
     dut->start = 1;
@@ -89,14 +97,16 @@ int main(int argc, char** argv) {
     long wait = 0;
     while (!dut->done && wait < 100000) { tick(); cycles++; wait++; }
     tested++;
-    const bool ok = dut->done && dut->y == want_y && dut->y2 == want_y2 && (dut->flags & 0x1f) == want_flags;
+    const uint64_t got_y = (uint64_t)dut->y[0] | ((uint64_t)dut->y[1] << 32);
+    const bool ok = dut->done && got_y == want_y && dut->y2 == want_y2
+                    && (dut->flags & 0x1f) == want_flags;
     if (!ok) {
       failed++;
       if (op >= 0 && op < 35) failed_by_op[op]++;
       if (failed <= 40 || verbose)
         std::printf("line %ld: %-9s fmt %s sel %s  a=%s b=%s c=%s  y %016llx y2 %016llx flags %02x, expected y %016llx y2 %016llx flags %02x%s\n",
                     line_no, (op >= 0 && op < 35) ? OP_NAMES[op] : "?", v[1].c_str(), v[3].c_str(),
-                    v[4].c_str(), v[5].c_str(), v[6].c_str(), (unsigned long long)dut->y,
+                    v[4].c_str(), v[5].c_str(), v[6].c_str(), (unsigned long long)got_y,
                     (unsigned long long)dut->y2, dut->flags & 0x1f, (unsigned long long)want_y,
                     (unsigned long long)want_y2, want_flags, dut->done ? "" : "  (no done)");
     }

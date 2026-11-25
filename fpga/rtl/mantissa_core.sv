@@ -1,11 +1,13 @@
 // Mantissa-1 core: cells, registers, pc, decode and control.
 //
-// The core knows nothing about floating point.  It moves 64-bit values
-// (mantissa_pkg: the bits of the double that holds a value), checks that an
-// address or an instruction number is a whole number in range, takes an
-// instruction number apart into decimal fields, and runs a small state
-// machine.  Every value operation, conversions between the narrow cell
-// encodings and the 64-bit form included, is a request to the FPU.
+// The core knows nothing about floating point.  It moves values (mantissa_pkg:
+// a half or a float as the 64 bits of the double that holds it, a quad as its
+// own 128 bits), checks that an address or an instruction number is a whole
+// number in range, takes an instruction number apart into decimal fields, and
+// runs a small state machine.  Every value operation on the narrow formats,
+// conversions between the narrow cell encodings and the 64-bit form included,
+// is a request to the FPU; quad has its register file (four by 128 bits), its
+// loads and stores and its CVTs, and no arithmetic yet.
 //
 // Timing, with a memory that answers one cycle after a request and an FPU that
 // answers one cycle after `start` (the synthesizable unit takes longer for
@@ -14,6 +16,7 @@
 //   NOP, PUT, PUTC, JMP                 1 cycle
 //   arithmetic, MOV, CVT, branches      2 cycles
 //   LDI, LD, ST, a positive BSGN        3 cycles
+//   LD.Q, ST.Q                          3 and 4: two words of cells, no FPU
 //
 // A store is written at the end of its cycle and the next fetch is issued in
 // the cycle after that, so no instruction is ever cached across a store.
@@ -45,14 +48,14 @@ module mantissa_core
   // the floating point unit
   output logic                     fpu_start,
   output logic [5:0]              fpu_op,            // mantissa_pkg::fpu_op_e
-  output logic [1:0]              fpu_fmt,           // mantissa_pkg: the format of the operation
-  output logic [1:0]              fpu_fmt2,          // the second format: JOIN's parts, MANT's exponent
+  output logic [2:0]              fpu_fmt,           // mantissa_pkg: the format of the operation
+  output logic [2:0]              fpu_fmt2,          // the second format: JOIN's parts, MANT's exponent
   output logic [1:0]               fpu_sel,           // for F_FROMBITS: which cell of a word the value is in
-  output logic [63:0]              fpu_a,
+  output logic [127:0]             fpu_a,             // a quad operand in full, a narrow one in the low 64
   output logic [63:0]              fpu_b,
   output logic [63:0]              fpu_c,
   input  logic                     fpu_done,
-  input  logic [63:0]              fpu_y,
+  input  logic [127:0]             fpu_y,             // a quad result in full, a narrow one in the low 64
   input logic [63:0]               fpu_y2,            // SPLIT's low half, MANT's exponent
   input  logic [4:0]               fpu_flags,
 
@@ -69,12 +72,12 @@ module mantissa_core
   output logic [1:0]              ev_fault,          // mantissa_pkg::fault_e
   output logic [63:0]              ev_pc,             // the pc the step began at
   output logic [2:0]               ev_nwr,            // 0 to 4 registers written
-  output logic [6:0]               ev_wcode0,         // the first register written, 0..95
+  output logic [6:0]               ev_wcode0,         // the first register written, 0..99
   output logic [6:0]               ev_wcode1,         // and the others, when there are ones
   output logic [6:0]               ev_wcode2,
   output logic [6:0]               ev_wcode3,
-  output logic [63:0]              ev_wval0,          // the values written
-  output logic [63:0]              ev_wval1,
+  output logic [127:0]             ev_wval0,          // the first value written: a quad in full
+  output logic [63:0]              ev_wval1,          // the others, which only the narrow formats write
   output logic [63:0]              ev_wval2,
   output logic [63:0]              ev_wval3,
   output logic [1:0]               ev_wprov0,         // where a written NaN came from (mantissa_pkg::PROV_*)
@@ -87,10 +90,11 @@ module mantissa_core
   output logic [6:0]               ev_wsrc3,
   output logic                     ev_store,
   output logic [AW-1:0]            ev_saddr,          // cell address
-  output logic [1:0]               ev_sfmt,           // the format stored: 1, 2 or 4 cells
-  output logic [63:0]              ev_sval,           // the value the register held
+  output logic [2:0]               ev_sfmt,           // the format stored: 1, 2, 4 or 8 cells
+  output logic [127:0]             ev_sval,           // the value the register held, a quad in full
   output logic                     ev_put,
-  output logic [63:0]              ev_putval,
+  output logic [127:0]             ev_putval,         // a quad PUT in full, a narrow one in the low 64
+  output logic                     ev_putq,           // ev_putval holds a quad: 32 hex digits, not 16
   output logic                     ev_putc,
   output logic [20:0]              ev_putcode         // the Unicode code point
 );
@@ -142,6 +146,7 @@ module mantissa_core
   state_e            state;
   logic [63:0]       pc;
   logic [63:0]       regs [0:95];          // h0..h31, f0..f31, d0..d31
+  logic [127:0]      qregs [0:3];          // q0..q3, the file the guard band became
   logic [4:0]        flags;                // the five sticky flags
   logic              limit_hit;            // the step limit was reached; nothing more runs
 
@@ -155,17 +160,21 @@ module mantissa_core
   logic [1:0]        r_ret;                // RET_*
   logic [3:0]        r_skip;               // cells the instruction takes when it falls through
   logic [1:0]        r_oret;               // O_*
-  logic [1:0]        r_fmt;
+  logic [2:0]        r_fmt;
+  logic [2:0]        r_fmt2;               // the second format, kept for ST_OPND:
+                                           // there mem_rdata is data, and fb would
+                                           // be decoded from whatever loaded
   logic [1:0]        r_opnd_off;           // the operand a branch wants is at pc + 4, or at pc + 8
   logic              r_wb2;                // the instruction writes a second register
   logic              r_setflags;           // the instruction's flags are sticky
   logic [1:0]        r_prov0, r_prov1;     // where a written NaN came from
   logic [6:0]        r_src0, r_src1;
   // a store or a load in progress
-  logic [1:0]        st_fmt, st_sel;
-  logic [2:0]        st_cells;              // 1, 2 or 4
+  logic [2:0]        st_fmt, st_sel;
+  logic [3:0]        st_cells;              // 1, 2, 4 or 8
   logic [AW-1:0]     st_idx;
-  logic [63:0]       st_val;
+  logic [127:0]      st_val;
+  logic              st_q2;                 // a quad memory op's second word is next
 
   assign halted     = (state == ST_HALT);
   assign fault      = (state == ST_FAULT);
@@ -208,15 +217,83 @@ module mantissa_core
   // of width.  This is memory._index in the reference: NaN, negative, past
   // the end, not whole and misaligned are all `address` faults.  The end is
   // `cells`, the size this machine was given, not all the memory built.
-  function automatic logic addr_valid(input logic [63:0] x, input logic [2:0] width,
+  // Width is 1, 2, 4 or 8 cells: half, float, double, quad.
+  function automatic logic addr_valid(input logic [63:0] x, input logic [3:0] width,
                                       input logic aligned);
     logic [54:0] v;
     logic        is_int;
     logic [AW:0] past;
     v = dbl_int(x, is_int);
-    past = {1'b0, v[AW-1:0]} + {{(AW-2){1'b0}}, width};
+    past = {1'b0, v[AW-1:0]} + {{(AW-3){1'b0}}, width};
     addr_valid = is_int && !(x[63] && (|x[62:0])) && (v[54:AW] == {(55-AW){1'b0}}) && (past <= cells)
-                 && (!aligned || (width == 3'd1) || ((width == 3'd2) ? !v[0] : (v[1:0] == 2'd0)));
+                 && (!aligned || (width == 4'd1) || ((v[2:0] & (width[2:0] - 3'd1)) == 3'd0));
+  endfunction
+
+  // The double that holds a quad register's value, for the 64-bit operand
+  // path: the value narrowed to double with one rounding, ties to even
+  // (fp.q_convert into D), and whether the narrowing was exact.  Any address
+  // a quad can name is small and whole, so it narrows exactly; a value the
+  // narrowing loses is no address either (past the end, or not a whole
+  // number), and the address checks fold `exact` in for that.  A quad NaN
+  // answers the shared double NaN, as q_convert does; a subnormal quad is
+  // below half of double's smallest subnormal and rounds to a signed zero.
+  function automatic logic [63:0] q_slice64(input logic [127:0] q, output logic exact);
+    logic [14:0]  e15, tt;
+    logic [112:0] m;
+    logic [51:0]  md;
+    logic [10:0]  ed;
+    logic [6:0]   t;
+    logic         s, guard, sticky, carry;
+    s      = q[127];
+    e15    = q[126:112];
+    m      = {1'b1, q[111:0]};                 // the significand, implicit bit in place
+    exact  = 1'b1;
+    guard  = 1'b0;
+    sticky = 1'b0;
+    md     = 52'd0;
+    ed     = 11'd0;
+    if (e15 == 15'h7FFF) begin
+      q_slice64 = |q[111:0] ? mantissa_pkg::NAN_BITS : {s, 11'h7FF, 52'd0};
+    end else if ((e15 == 15'd0) && (q[111:0] == 112'd0)) begin
+      q_slice64 = {s, 63'd0};                  // a zero keeps its sign
+    end else if (e15 == 15'd0) begin
+      q_slice64 = {s, 63'd0};                  // a subnormal quad rounds to zero
+      exact     = 1'b0;
+    end else if (e15 > 15'd17406) begin
+      q_slice64 = {s, 11'h7FF, 52'd0};         // past double's range
+      exact     = 1'b0;
+    end else if (e15 >= 15'd15361) begin
+      // a normal double: biased exponent e15 - 15360, the fraction from the
+      // top of quad's significand, rounded from bit 59 down
+      ed     = e15 - 15'd15360;
+      md     = m[111:60];
+      guard  = m[59];
+      sticky = |m[58:0];
+      {carry, md} = md + ((guard && (sticky || md[0])) ? 1'b1 : 1'b0);
+      if (carry) begin
+        q_slice64 = {s, 11'h7FF, 52'd0};       // the rounding carried past double's top
+        exact     = 1'b0;
+      end else begin
+        q_slice64 = {s, ed, md};
+        exact     = !(guard || sticky);
+      end
+    end else begin
+      // a double subnormal: the quantum is 2**-1074, quad's significand
+      // shifts down by 15421 - e15 places
+      tt = 15'd15421 - e15;                    // 61 to 15420
+      if (tt <= 15'd113) begin
+        t      = tt[6:0];
+        md     = m >> t;
+        guard  = m[t - 7'd1];
+        sticky = |(m & ((113'd1 << (t - 7'd1)) - 113'd1));
+        {carry, md} = md + ((guard && (sticky || md[0])) ? 1'b1 : 1'b0);
+        q_slice64 = carry ? {s, 11'd1, 52'd0} : {s, 11'd0, md};
+        exact     = !(guard || sticky);
+      end else begin
+        q_slice64 = {s, 63'd0};                // everything fell below the quantum
+        exact     = 1'b0;
+      end
+    end
   endfunction
 
   // The cell index of a double that addr_valid has accepted.
@@ -268,7 +345,7 @@ module mantissa_core
   fpu_op_e d_fop;
   logic        d_fields, d_types, d_num_ok, d_ok;
   logic [6:0]  d_ra, d_rb, d_rc;
-  logic [1:0]  fa, fb, fc;
+  logic [2:0]  fa, fb, fc;
 
   always_comb begin
     ie = mem_rdata[62:52];
@@ -386,17 +463,18 @@ module mantissa_core
   end
 
   // A field the instruction does not use must be 00; one it uses must name a
-  // register, 00 to 95.  Register code = file * 32 + index.
+  // register, 00 to 99: three files of 32 and the four quad codes.  Register
+  // code = file * 32 + index, quad's file at 96.
   always_comb begin
-    fa = d_a[6:5];
-    fb = d_b[6:5];
-    fc = d_c[6:5];
-    d_fields = ((d_use[0] ? (d_a < 7'd96) : (d_a == 7'd0))
-                && (d_use[1] ? (d_b < 7'd96) : (d_b == 7'd0))
-                && (d_use[2] ? (d_c < 7'd96) : (d_c == 7'd0)));
-    d_ra = {fa, d_a[4:0]};
-    d_rb = {fb, d_b[4:0]};
-    d_rc = {fc, d_c[4:0]};
+    fa = {1'b0, d_a[6:5]};
+    fb = {1'b0, d_b[6:5]};
+    fc = {1'b0, d_c[6:5]};
+    d_fields = ((d_use[0] ? (d_a < 7'd100) : (d_a == 7'd0))
+                && (d_use[1] ? (d_b < 7'd100) : (d_b == 7'd0))
+                && (d_use[2] ? (d_c < 7'd100) : (d_c == 7'd0)));
+    d_ra = {d_a[6:5], d_a[4:0]};
+    d_rb = {d_b[6:5], d_b[4:0]};
+    d_rc = {d_c[6:5], d_c[4:0]};
     d_num_ok = ins_whole && ins_range && d_fields && (d_cls != C_ILLEGAL);
   end
 
@@ -426,11 +504,26 @@ module mantissa_core
 
   // ---- operands ----------------------------------------------------------------
   logic [63:0] ra, rb, rc;              // the registers the fields name
+  logic ra_ex, rb_ex, rc_ex;            // a quad operand's narrowing was exact
+  logic [63:0] ra_q, rb_q, rc_q;
+  logic        ra_qex, rb_qex, rc_qex;
 
   always_comb begin
-    ra = regs[(fa == 2'd3) ? 7'd0 : d_ra];      // 3 names no file; the decode will fault
-    rb = regs[(fb == 2'd3) ? 7'd0 : d_rb];
-    rc = regs[(fc == 2'd3) ? 7'd0 : d_rc];
+    // the quad reads, whether the field names a quad or not: on the narrow
+    // codes the low bits land harmlessly inside the q file
+    ra_q  = q_slice64(qregs[d_a[1:0]], ra_qex);
+    rb_q  = q_slice64(qregs[d_b[1:0]], rb_qex);
+    rc_q  = q_slice64(qregs[d_c[1:0]], rc_qex);
+    // file 3 is the quad file: its register travels as the double its value
+    // narrows to, and the exact flag says whether that narrowing was exact
+    // (an inexact narrowing names no address; see q_slice64).  On the narrow
+    // files the exact flags ride high.
+    ra    = (fa == mantissa_pkg::FMT_Q) ? ra_q : regs[(fa == mantissa_pkg::FMT_Q) ? 7'd0 : d_ra];
+    ra_ex = (fa == mantissa_pkg::FMT_Q) ? ra_qex : 1'b1;
+    rb    = (fb == mantissa_pkg::FMT_Q) ? rb_q : regs[(fb == mantissa_pkg::FMT_Q) ? 7'd0 : d_rb];
+    rb_ex = (fb == mantissa_pkg::FMT_Q) ? rb_qex : 1'b1;
+    rc    = (fc == mantissa_pkg::FMT_Q) ? rc_q : regs[(fc == mantissa_pkg::FMT_Q) ? 7'd0 : d_rc];
+    rc_ex = (fc == mantissa_pkg::FMT_Q) ? rc_qex : 1'b1;
   end
 
   // ---- control -----------------------------------------------------------------
@@ -438,6 +531,7 @@ module mantissa_core
   fault_e dec_fault;
   logic y_one, y_zero, y_negone, taken, bsgn_pos;
   logic adv_now, target_now, jmp_now, retire_now, limit_new;
+  logic qld_done;                       // a quad load's second word has landed
   logic [3:0] adv_k;
   logic fetch_now, opnd_here;
   logic [2:0] cell_off;
@@ -450,12 +544,12 @@ module mantissa_core
   logic          putc_is_int;
   logic          boot_ok, opnd4_ok, opnd8_ok, pcn_ok;
   logic          st_ok, ld_ok, jmp_ok, target_ok, putc_ok;
-  logic [2:0]    st_width, ld_width;
+  logic [3:0]    st_width, ld_width;
 
   always_comb begin
     pc_i = addr_index(pc);
     boot_i = addr_index(boot_pc);
-    boot_ok = addr_valid(boot_pc, 3'd4, 1'b1);
+    boot_ok = addr_valid(boot_pc, 4'd4, 1'b1);
 
     pc4_i = pc_i + 4;
     pc8_i = pc_i + 8;
@@ -469,16 +563,19 @@ module mantissa_core
     pcn_d = int_to_dbl(pcn);
     link_d = int_to_dbl(pc8_i);
 
-    st_width = {2'b00, 1'b1} << fb;
-    ld_width = {2'b00, 1'b1} << fa;
-    st_ok = addr_valid(ra, st_width, 1'b1);
-    ld_ok = addr_valid(rb, ld_width, 1'b1);
-    jmp_ok = addr_valid(ra, 3'd4, 1'b1);
+    st_width = 4'd1 << fb;
+    ld_width = 4'd1 << fa;
+    // a quad operand whose narrowing to double lost bits names no address:
+    // the true value is past the end, or not a whole number, either way an
+    // `address` fault
+    st_ok = addr_valid(ra, st_width, 1'b1) && ra_ex;
+    ld_ok = addr_valid(rb, ld_width, 1'b1) && rb_ex;
+    jmp_ok = addr_valid(ra, 4'd4, 1'b1);
     st_i = addr_index(ra);
     ld_i = addr_index(rb);
     jmp_i = addr_index(ra);
 
-    target_ok = addr_valid(mem_rdata, 3'd4, 1'b1);
+    target_ok = addr_valid(mem_rdata, 4'd4, 1'b1);
     target_i = addr_index(mem_rdata);
 
     // a character: a whole number from 0 to 0x10FFFF that is not a surrogate
@@ -552,7 +649,13 @@ module mantissa_core
           adv_k = r_skip;                         // past the operand, or both of BSGN's
         end
       end
-      ST_OPND: target_now = (r_oret == O_TARGET) || (r_oret == O_JAL);
+      ST_OPND: begin
+        target_now = (r_oret == O_TARGET) || (r_oret == O_JAL);
+        if (qld_done) begin                          // a quad load retires here: no FPU
+          adv_now = 1'b1;
+          adv_k = r_skip;                            // 4
+        end
+      end
       ST_POST: adv_now = 1'b1;
       default: ;
     endcase
@@ -575,7 +678,7 @@ module mantissa_core
           else retire_now = (r_ret == RET_ALU) || ((r_ret == RET_BRANCH) && !taken);
         end
       end
-      ST_OPND:  retire_now = (r_oret == O_TARGET) || (r_oret == O_JAL);
+      ST_OPND:  retire_now = qld_done || (r_oret == O_TARGET) || (r_oret == O_JAL);
       ST_POST:  retire_now = 1'b1;
       ST_FETCH_FAULT: retire_now = !limit_hit;
       default: ;
@@ -613,9 +716,9 @@ module mantissa_core
         end
       end
       ST_OPND: begin
-        if (target_now) begin
-          fetch_now = 1'b1;
-          fetch_idx = target_i;
+        if (target_now || qld_done) begin           // a quad load retires here and
+          fetch_now = 1'b1;                         // needs the fetch the advance assumes
+          fetch_idx = target_now ? target_i : pcn;
         end
       end
       default: ;
@@ -625,25 +728,31 @@ module mantissa_core
   // The memory port.  A cycle either fetches, reads an operand (the target of
   // a branch is read while the comparison runs: reading has no effect, and
   // its address is only held against the machine if the branch is taken), or
-  // writes a store.
+  // writes a store.  A quad load reads its two words over two cycles and a
+  // quad store writes them the same way: the cells of a quad value are its
+  // own 128 bits, most significant cell first, so the first word carries the
+  // high half and the second the low one, no FPU and no shift.
   always_comb begin
     opnd_here = (d_cls == C_LDI) || (d_cls == C_BR) || (d_cls == C_JAL)
                 || (d_cls == C_BSGN) || (d_cls == C_BZ) || (d_cls == C_BCMP);
+    qld_done = (state == ST_OPND) && (r_oret == O_LD)
+               && (r_fmt == mantissa_pkg::FMT_Q) && st_q2;
     mem_en = 1'b0;
     mem_we = 1'b0;
     mem_wmask = 4'd0;
     mem_wdata = 64'd0;
     mem_addr = {(AW-2){1'b0}};
-    // the shift that puts a value's cells, most significant first, into the
-    // word at cell st_sel: 16 * (4 - cells - sel)
-    cell_off = 3'd4 - st_cells - {1'b0, st_sel};
+    // the shift that puts a narrow value's cells, most significant first,
+    // into the word at cell st_sel: 16 * (4 - cells - sel); quad stores take
+    // whole words and never shift
+    cell_off = 3'd4 - st_cells[2:0] - {1'b0, st_sel};
     if (fetch_now) begin
       mem_en = 1'b1;
       mem_addr = fetch_idx[AW-1:2];
     end else begin
       case (state)
         ST_DECODE: begin
-          if (dec_go && (d_cls == C_LD)) begin          // the word a load reads
+          if (dec_go && (d_cls == C_LD)) begin          // the first word a load reads
             mem_en = 1'b1;
             mem_addr = ld_i[AW-1:2];
           end else if (dec_go && opnd_here && opnd4_ok) begin
@@ -651,8 +760,20 @@ module mantissa_core
             mem_addr = pc4_i[AW-1:2];
           end
         end
+        ST_OPND: begin
+          if ((r_oret == O_LD) && (r_fmt == mantissa_pkg::FMT_Q) && !st_q2) begin
+            mem_en = 1'b1;                              // the quad load's second word
+            mem_addr = st_idx[AW-1:2] + {{(AW-3){1'b0}}, 1'b1};
+          end
+        end
         ST_FPU: begin
-          if (fpu_done && (r_ret == RET_ST)) begin
+          if ((r_ret == RET_ST) && (st_fmt == mantissa_pkg::FMT_Q)) begin
+            mem_en = 1'b1;
+            mem_we = 1'b1;
+            mem_wmask = 4'd15;
+            mem_addr = st_idx[AW-1:2] + (st_q2 ? {{(AW-3){1'b0}}, 1'b1} : {(AW-2){1'b0}});
+            mem_wdata = st_q2 ? st_val[63:0] : st_val[127:64];
+          end else if (fpu_done && (r_ret == RET_ST)) begin
             mem_en = 1'b1;
             mem_we = 1'b1;
             mem_addr = st_idx[AW-1:2];
@@ -660,7 +781,7 @@ module mantissa_core
             // float (sel is 0 or 2) covers sel and sel + 1, a double all four
             mem_wmask = (st_fmt == mantissa_pkg::FMT_H) ? (4'd8 >> st_sel)
                         : (st_fmt == mantissa_pkg::FMT_F) ? (4'd12 >> st_sel) : 4'd15;
-            mem_wdata = fpu_y << {cell_off, 4'b0};
+            mem_wdata = fpu_y[63:0] << {cell_off, 4'b0};
           end else if (fpu_done && (r_ret == RET_BRANCH) && taken && bsgn_pos && opnd8_ok) begin
             mem_en = 1'b1;                                            // BSGN's second target
             mem_addr = pc8_i[AW-1:2];
@@ -673,14 +794,16 @@ module mantissa_core
 
   // The FPU port.  A request is raised for one cycle, and what it carries is
   // valid in that same cycle: it comes straight from the decode and the
-  // register files, or from the operand the memory has just delivered.
+  // register files, or from the operand the memory has just delivered.  A
+  // quad source travels in the upper half of operand a; a quad store or load
+  // raises no request at all, its cells are the value.
   always_comb begin
     fpu_start = 1'b0;
     fpu_op = mantissa_pkg::F_ADD;
     fpu_fmt = mantissa_pkg::fmt_e'(fa);
     fpu_fmt2 = mantissa_pkg::fmt_e'(fb);
     fpu_sel = 2'd0;
-    fpu_a = 64'd0;
+    fpu_a = {64'd0, rb};
     fpu_b = 64'd0;
     fpu_c = 64'd0;
     case (state)
@@ -690,30 +813,36 @@ module mantissa_core
         case (d_cls)
           C_ALU, C_VEC: begin
             fpu_op = d_fop;
-            fpu_a = ((d_fop == mantissa_pkg::F_SPLIT) || (d_fop == mantissa_pkg::F_MANT)) ? rc : rb;
+            // SPLIT and MANT read their source from c; everything else from
+            // b.  A quad source travels whole in the upper half of a.
+            fpu_a = ((d_fop == mantissa_pkg::F_SPLIT) || (d_fop == mantissa_pkg::F_MANT))
+                    ? ((fc == mantissa_pkg::FMT_Q) ? qregs[d_c[1:0]] : {64'd0, rc})
+                    : ((fb == mantissa_pkg::FMT_Q) ? qregs[d_b[1:0]] : {64'd0, rb});
             fpu_b = rc;
             fpu_c = ra;                          // FMA's addend is its own destination
           end
           C_ST: begin
+            // a quad store carries its own bits: no request, no cells
+            if (fb == mantissa_pkg::FMT_Q) fpu_start = 1'b0;
             fpu_op = mantissa_pkg::F_TOBITS;           // the value, b, as the cells it becomes
             fpu_fmt = mantissa_pkg::fmt_e'(fb);
-            fpu_a = rb;
+            fpu_a = {64'd0, rb};
           end
           C_BSGN: begin
             fpu_op = mantissa_pkg::F_CMP;
             fpu_fmt = mantissa_pkg::FMT_D;
-            fpu_a = ra;
+            fpu_a = {64'd0, ra};
             fpu_b = 64'd0;
           end
           C_BZ: begin
             fpu_op = mantissa_pkg::F_EQ;
             fpu_fmt = mantissa_pkg::FMT_D;
-            fpu_a = ra;
+            fpu_a = {64'd0, ra};
             fpu_b = 64'd0;
           end
           C_BCMP: begin
             fpu_fmt = mantissa_pkg::FMT_D;
-            fpu_a = ra;
+            fpu_a = {64'd0, ra};
             fpu_b = rb;
             case (d_op)
               OP_BEQ, OP_BNE: fpu_op = mantissa_pkg::F_EQ;
@@ -726,27 +855,33 @@ module mantissa_core
       end
       ST_FPU: begin
         // a vector instruction restarts its FPU call per lane, on the cycle
-        // the previous lane completes
+        // the previous lane completes.  A vector group on quad registers has
+        // no arithmetic behind it: the reads stay in bounds, operand a gets
+        // the narrowed first source, and the model answers the canonical
+        // NaN, which nothing feeds.
         if ((r_ret == RET_VEC) && fpu_done && (r_lane != lanes_of(r_op) - 1)) begin
           fpu_start = 1'b1;
           fpu_op   = r_fop;
           fpu_fmt  = r_fmt;
-          fpu_a    = regs[r_b + r_lane + 1];
-          fpu_b    = regs[r_c + r_lane + 1];
-          fpu_c    = regs[r_a + r_lane + 1];   // FMA's addend is its own destination
+          fpu_a    = regs[(r_fmt == mantissa_pkg::FMT_Q) ? 7'd0 : (r_b + r_lane + 7'd1)];
+          fpu_b    = regs[(r_fmt == mantissa_pkg::FMT_Q) ? 7'd0 : (r_c + r_lane + 7'd1)];
+          fpu_c    = regs[(r_fmt == mantissa_pkg::FMT_Q) ? 7'd0 : (r_a + r_lane + 7'd1)];
         end
       end
       ST_OPND: begin
-        fpu_start = (r_oret == O_LDI) || (r_oret == O_LD);
+        fpu_start = (r_oret == O_LDI)
+                    || ((r_oret == O_LD) && (r_fmt != mantissa_pkg::FMT_Q));
         if (r_oret == O_LDI) begin
           fpu_op = mantissa_pkg::F_CVT;
           fpu_fmt = mantissa_pkg::fmt_e'(r_fmt);
-          fpu_a = mem_rdata;
+          fpu_fmt2 = mantissa_pkg::fmt_e'(r_fmt2);
+          fpu_a = {64'd0, mem_rdata};
         end else if (r_oret == O_LD) begin
           fpu_op = mantissa_pkg::F_FROMBITS;
           fpu_fmt = mantissa_pkg::fmt_e'(r_fmt);
+          fpu_fmt2 = mantissa_pkg::fmt_e'(r_fmt2);
           fpu_sel = st_sel;
-          fpu_a = mem_rdata;
+          fpu_a = {64'd0, mem_rdata};
         end
       end
       default: ;
@@ -763,13 +898,15 @@ module mantissa_core
       limit_hit <= 1'b0;
       fault_kind <= mantissa_pkg::FAULT_ADDRESS;
       for (int i = 0; i < 96; i++) regs[i] <= 64'd0;
+      for (int i = 0; i < 4; i++) qregs[i] <= 128'd0;
       r_ret <= 2'd0;
       r_oret <= 2'd0;
       r_skip <= 4'd4;
       r_op <= 7'd0;
       r_a <= 7'd0;
       r_b <= 7'd0;
-      r_fmt <= 2'd0;
+      r_fmt <= 3'd0;
+      r_fmt2 <= 3'd0;
       r_opnd_off <= 2'd0;
       r_wb2 <= 1'b0;
       r_setflags <= 1'b0;
@@ -777,11 +914,12 @@ module mantissa_core
       r_prov1 <= 2'd0;
       r_src0 <= 7'd0;
       r_src1 <= 7'd0;
-      st_fmt <= 2'd0;
-      st_cells <= 3'd1;
+      st_fmt <= 3'd0;
+      st_cells <= 4'd1;
       st_sel <= 2'd0;
       st_idx <= {AW{1'b0}};
-      st_val <= 64'd0;
+      st_val <= 128'd0;
+      st_q2 <= 1'b0;
       ev_valid <= 1'b0;
       ev_end <= mantissa_pkg::EV_RETIRE;
       ev_fault <= mantissa_pkg::FAULT_ADDRESS;
@@ -791,7 +929,7 @@ module mantissa_core
       ev_wcode1 <= 7'd0;
       ev_wcode2 <= 7'd0;
       ev_wcode3 <= 7'd0;
-      ev_wval0 <= 64'd0;
+      ev_wval0 <= 128'd0;
       ev_wval1 <= 64'd0;
       ev_wval2 <= 64'd0;
       ev_wval3 <= 64'd0;
@@ -805,10 +943,11 @@ module mantissa_core
       ev_wsrc3 <= 7'd0;
       ev_store <= 1'b0;
       ev_saddr <= {AW{1'b0}};
-      ev_sfmt <= 2'd0;
-      ev_sval <= 64'd0;
+      ev_sfmt <= 3'd0;
+      ev_sval <= 128'd0;
       ev_put <= 1'b0;
-      ev_putval <= 64'd0;
+      ev_putval <= 128'd0;
+      ev_putq <= 1'b0;
       ev_putc <= 1'b0;
       ev_putcode <= 21'd0;
     end else begin
@@ -822,7 +961,7 @@ module mantissa_core
       ev_wcode1 <= 7'd0;
       ev_wcode2 <= 7'd0;
       ev_wcode3 <= 7'd0;
-      ev_wval0 <= 64'd0;
+      ev_wval0 <= 128'd0;
       ev_wval1 <= 64'd0;
       ev_wval2 <= 64'd0;
       ev_wval3 <= 64'd0;
@@ -836,10 +975,11 @@ module mantissa_core
       ev_wsrc3 <= 7'd0;
       ev_store <= 1'b0;
       ev_saddr <= {AW{1'b0}};
-      ev_sfmt <= 2'd0;
-      ev_sval <= 64'd0;
+      ev_sfmt <= 3'd0;
+      ev_sval <= 128'd0;
       ev_put <= 1'b0;
-      ev_putval <= 64'd0;
+      ev_putval <= 128'd0;
+      ev_putq <= 1'b0;
       ev_putc <= 1'b0;
       ev_putcode <= 21'd0;
       limit_hit <= limit_new;
@@ -890,7 +1030,8 @@ module mantissa_core
 
               C_PUT: begin
                 ev_put <= 1'b1;
-                ev_putval <= ra;
+                ev_putval <= (fa == mantissa_pkg::FMT_Q) ? qregs[d_a[1:0]] : {64'd0, ra};
+                ev_putq <= (fa == mantissa_pkg::FMT_Q);
                 step_count <= step_count + 32'd1;
               end
 
@@ -910,6 +1051,7 @@ module mantissa_core
                 r_b <= d_rb;
                 r_c <= d_rc;
                 r_fmt <= fa;
+                r_fmt2 <= fb;
                 r_fop <= d_fop;
                 r_lane <= 2'd0;
                 r_wb2 <= (d_fop == mantissa_pkg::F_SPLIT) || (d_fop == mantissa_pkg::F_MANT);
@@ -930,10 +1072,11 @@ module mantissa_core
 
               C_ST: begin
                 st_fmt <= fb;
-                st_cells <= {2'b0, 1'b1} << fb;
+                st_cells <= 4'd1 << fb;
                 st_sel <= st_i[1:0];                       // the cell of the word it starts at
                 st_idx <= st_i[AW-1:0];
-                st_val <= rb;
+                st_val <= (fb == mantissa_pkg::FMT_Q) ? qregs[d_b[1:0]] : {64'd0, rb};
+                st_q2 <= 1'b0;
                 r_ret <= RET_ST;
                 state <= ST_FPU;
               end
@@ -943,6 +1086,7 @@ module mantissa_core
                 r_skip <= d_skip;
                 r_a <= d_ra;
                 r_fmt <= fa;
+                r_fmt2 <= mantissa_pkg::FMT_D;           // the inline operand is a double
                 r_oret <= O_LDI;
                 r_prov0 <= mantissa_pkg::PROV_CANON;
                 r_wb2 <= 1'b0;
@@ -955,11 +1099,14 @@ module mantissa_core
                 r_skip <= d_skip;
                 r_a <= d_ra;
                 r_fmt <= fa;
+                r_fmt2 <= fb;
                 r_oret <= O_LD;
                 r_prov0 <= mantissa_pkg::PROV_FRESH;       // a load makes a value of its own
                 r_wb2 <= 1'b0;
                 r_setflags <= 1'b0;
                 st_sel <= ld_i[1:0];                       // which cell of the word it starts at
+                st_idx <= ld_i[AW-1:0];                    // a quad load's second word lives one past it
+                st_q2 <= 1'b0;
                 state <= ST_OPND;
               end
 
@@ -994,15 +1141,25 @@ module mantissa_core
                    $time, r_ret, fpu_done, r_lane, fpu_start, fpu_op,
                    ev_valid, ev_nwr, ev_wcode0, ev_wcode1, ev_wcode2, ev_wcode3);
 `endif
-          if (fpu_done) begin
+          if ((r_ret == RET_ST) && (st_fmt == mantissa_pkg::FMT_Q)) begin
+            // the quad store raised no request: its two words go out on two
+            // cycles, then the fetch.  Nothing waits on done.
+            if (st_q2) state <= ST_POST;
+            else st_q2 <= 1'b1;
+          end else if (fpu_done) begin
             case (r_ret)
               RET_VEC: begin
                 // one lane per FPU call; the write is arithmetic, so its NaN
-                // provenance is always the canonical one
-                regs[r_a + r_lane] <= fpu_y;
+                // provenance is always the canonical one.  A vector group on
+                // the q file has no arithmetic behind it: its writes wrap
+                // inside the four quad registers rather than leave the file.
+                if (r_fmt == mantissa_pkg::FMT_Q)
+                  qregs[(r_a[1:0] + r_lane) & 2'b11] <= fpu_y;
+                else
+                  regs[r_a + r_lane] <= fpu_y[63:0];
                 if (r_setflags) flags <= flags | fpu_flags;
                 v_code[r_lane] <= r_a + r_lane;
-                v_val[r_lane] <= fpu_y;
+                v_val[r_lane] <= fpu_y[63:0];
                 if (r_lane == lanes_of(r_op) - 1) begin
                   ev_nwr <= {1'b0, lanes_of(r_op)};
                   ev_wcode0 <= v_code[0];
@@ -1016,10 +1173,10 @@ module mantissa_core
                     ev_wval1 <= v_val[1];
                     ev_wval2 <= v_val[2];
                     ev_wcode3 <= r_a + r_lane;
-                    ev_wval3 <= fpu_y;
+                    ev_wval3 <= fpu_y[63:0];
                   end else begin
                     ev_wcode1 <= r_a + r_lane;
-                    ev_wval1 <= fpu_y;
+                    ev_wval1 <= fpu_y[63:0];
                   end
                   ev_wprov0 <= mantissa_pkg::PROV_CANON;
                   ev_wprov1 <= mantissa_pkg::PROV_CANON;
@@ -1032,8 +1189,11 @@ module mantissa_core
                 end
               end
               RET_ALU: begin
-                regs[r_a] <= fpu_y;
-                if (r_wb2) regs[r_b] <= fpu_y2;
+                // a quad destination (MOV q, LDI.Q, CVT into q) takes the
+                // whole answer; the narrow files take the low 64 bits
+                if (r_fmt == mantissa_pkg::FMT_Q) qregs[r_a[1:0]] <= fpu_y;
+                else regs[r_a] <= fpu_y[63:0];
+                if (r_wb2) regs[r_b] <= fpu_y2;            // SPLIT and MANT never write a quad first
                 if (r_setflags) flags <= flags | fpu_flags;
                 ev_nwr <= r_wb2 ? 3'd2 : 3'd1;
                 ev_wcode0 <= r_a;
@@ -1065,9 +1225,19 @@ module mantissa_core
           if (r_oret == O_LDI) begin
             r_ret <= RET_ALU;
             state <= ST_FPU;
-          end else if (r_oret == O_LD) begin
+          end else if ((r_oret == O_LD) && (r_fmt != mantissa_pkg::FMT_Q)) begin
             r_ret <= RET_ALU;
             state <= ST_FPU;
+          end else if ((r_oret == O_LD) && !st_q2) begin
+            st_val <= {mem_rdata, 64'd0};              // the first word: the high half
+            st_q2 <= 1'b1;                             // the second word arrives next cycle
+          end else if (qld_done) begin
+            qregs[r_a[1:0]] <= {st_val[127:64], mem_rdata};
+            ev_nwr <= 3'd1;
+            ev_wcode0 <= r_a;
+            ev_wval0 <= {st_val[127:64], mem_rdata};
+            ev_wprov0 <= mantissa_pkg::PROV_FRESH;     // a load makes a value of its own
+            step_count <= step_count + 32'd1;
           end else begin
             if (!target_now) begin
               // the operand ran off the end of memory, or the target is not a

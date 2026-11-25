@@ -40,7 +40,7 @@ module mantissa_top
   output logic [6:0]               ev_wcode1,
   output logic [6:0]               ev_wcode2,
   output logic [6:0]               ev_wcode3,
-  output logic [63:0]              ev_wval0,
+  output logic [127:0]             ev_wval0,
   output logic [63:0]              ev_wval1,
   output logic [63:0]              ev_wval2,
   output logic [63:0]              ev_wval3,
@@ -55,10 +55,11 @@ module mantissa_top
   output logic [63:0]              capacity,          // the number of cells, as a double
   output logic                     ev_store,
   output logic [AW-1:0]            ev_saddr,
-  output logic [1:0]               ev_sfmt,
-  output logic [63:0]              ev_sval,
+  output logic [2:0]               ev_sfmt,
+  output logic [127:0]             ev_sval,
   output logic                     ev_put,
-  output logic [63:0]              ev_putval,
+  output logic [127:0]             ev_putval,
+  output logic                     ev_putq,
   output logic                     ev_putc,
   output logic [20:0]              ev_putcode
 );
@@ -74,11 +75,12 @@ module mantissa_top
   logic [3:0]      ram_wmask;
   logic [63:0]     ram_wdata;
   // the core's FPU port
-  logic                 fpu_start, fpu_done;
+  logic                  fpu_start, fpu_done;
   logic [5:0]            fpu_op;      // mantissa_pkg::fpu_op_e
-  logic [1:0]            fpu_fmt, fpu_fmt2;
+  logic [2:0]            fpu_fmt, fpu_fmt2;
   logic [1:0]            fpu_sel;
-  logic [63:0]           fpu_a, fpu_b, fpu_c, fpu_y, fpu_y2;
+  logic [127:0]          fpu_a, fpu_y;
+  logic [63:0]           fpu_b, fpu_c, fpu_y2;
   logic [4:0]            fpu_flags;
 
   mantissa_core
@@ -100,7 +102,7 @@ module mantissa_top
     .ev_wprov0(ev_wprov0), .ev_wprov1(ev_wprov1), .ev_wprov2(ev_wprov2), .ev_wprov3(ev_wprov3),
     .ev_wsrc0(ev_wsrc0), .ev_wsrc1(ev_wsrc1), .ev_wsrc2(ev_wsrc2), .ev_wsrc3(ev_wsrc3),
     .ev_store(ev_store), .ev_saddr(ev_saddr), .ev_sfmt(ev_sfmt), .ev_sval(ev_sval),
-    .ev_put(ev_put), .ev_putval(ev_putval), .ev_putc(ev_putc), .ev_putcode(ev_putcode)
+    .ev_put(ev_put), .ev_putval(ev_putval), .ev_putq(ev_putq), .ev_putc(ev_putc), .ev_putcode(ev_putcode)
   );
 
   mantissa_fpu

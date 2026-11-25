@@ -16,26 +16,29 @@
 //   start    one cycle, with op, fmt, fmt2, sel and the operands
 //   done     one cycle, one cycle after start, with y, y2 and the flags
 //
-// Across the interface a value is the 64 bits of the double that holds it.
+// Across the interface a value travels as the bits that hold it: a half or a
+// float as the 64 bits of the double that holds it, a quad as its own 128
+// bits (operand a and result y; quad CVT is this slice's business, quad
+// arithmetic is not the model's and answers the canonical quad NaN).
 `timescale 1ns / 1ps
 
 module mantissa_fpu
   import mantissa_pkg::*;
 (
-  input  logic        clk,
-  input  logic        rst_n,
-  input  logic        start,
-  input  logic [5:0]  op,      // fpu_op_e
-  input  logic [1:0]  fmt,     // fmt_e
-  input  logic [1:0]  fmt2,
-  input  logic [1:0]  sel,
-  input  logic [63:0] a,
-  input  logic [63:0] b,
-  input  logic [63:0] c,
-  output logic        done,
-  output logic [63:0] y,
-  output logic [63:0] y2,
-  output logic [4:0]  flags
+  input  logic         clk,
+  input  logic         rst_n,
+  input  logic         start,
+  input  logic [5:0]   op,      // fpu_op_e
+  input  logic [2:0]   fmt,     // fmt_e
+  input  logic [2:0]   fmt2,
+  input  logic [1:0]   sel,
+  input  logic [127:0] a,       // a quad travels here in full; the narrow formats in the low 64
+  input  logic [63:0]  b,
+  input  logic [63:0]  c,
+  output logic         done,
+  output logic [127:0] y,       // a quad result in full; the narrow formats in the low 64
+  output logic [63:0]  y2,
+  output logic [4:0]   flags
 );
 
   // ---- the C library, which is what Python's math module calls -----------------
@@ -52,6 +55,12 @@ module mantissa_fpu
   import "DPI-C" function real c_copysign(real x, real y);
   import "DPI-C" function int unsigned c_fbits(real x);        // the float pattern nearest to x
   import "DPI-C" function shortint unsigned c_hbits(real x);   // the half pattern nearest to x
+  // the quad conversions, in C++ integer math (fp.convert_into_q and fp.q_convert)
+  import "DPI-C" function void c_q_widen(input longint unsigned a, output longint unsigned hi,
+                                         output longint unsigned lo, output int flags);
+  import "DPI-C" function void c_q_narrow(input longint unsigned ahi, input longint unsigned alo,
+                                          input int dst, output longint unsigned yv,
+                                          output int flags);
 
   localparam real TWO_53 = 9007199254740992.0;
 
@@ -95,7 +104,7 @@ module mantissa_fpu
     return bx[63];
   endfunction
 
-  function automatic real min_normal(input logic [1:0] f);
+  function automatic real min_normal(input logic [2:0] f);
     return c_ldexp(1.0, 1 - f_emax(f));
   endfunction
 
@@ -122,7 +131,7 @@ module mantissa_fpu
   // fp._round_ratio.  Round the exact rational +-num * 2**-den_exp to the
   // format, ties to even.  num is not 0.  The flags are INEXACT, OVERFLOW and
   // UNDERFLOW; tininess is judged after rounding.
-  function automatic void round_ratio(input logic [1:0] f, input big_t num, input logic neg,
+  function automatic void round_ratio(input logic [2:0] f, input big_t num, input logic neg,
                                       input int den_exp, output real value, output logic [4:0] fl);
     int p, emax, emin, nbits, est, qe, s;
     big_t q, rm, num2;
@@ -256,7 +265,7 @@ module mantissa_fpu
 
   // ---- cells and bit patterns: fp.from_bits, fp.to_bits -------------------------
 
-  function automatic real from_bits(input logic [1:0] f, input logic [63:0] w);
+  function automatic real from_bits(input logic [2:0] f, input logic [63:0] w);
     int e;
     real m;
     logic sgn;
@@ -290,7 +299,7 @@ module mantissa_fpu
 
   // The cells x occupies, most significant cell first, as 64 bits.  x is a
   // value of the format, so rounding it once more changes nothing.
-  function automatic logic [63:0] to_bits(input logic [1:0] f, input real x);
+  function automatic logic [127:0] to_bits(input logic [2:0] f, input real x);
     logic [63:0] bx;
     bx = $realtobits(x);
     if (is_nan(x)) begin
@@ -308,7 +317,7 @@ module mantissa_fpu
   // ---- conversions ---------------------------------------------------------------
 
   // fp.convert: move a value into the dst format, rounding once.
-  function automatic void convert(input logic [1:0] dst, input real x, output real v, output logic [4:0] fl);
+  function automatic void convert(input logic [2:0] dst, input real x, output real v, output logic [4:0] fl);
     int ex;
     big_t mx;
     if (is_nan(x)) begin
@@ -323,7 +332,7 @@ module mantissa_fpu
   endfunction
 
   // fp._narrow: round a finite double to the format.  Only the rounding flags.
-  function automatic void narrow(input logic [1:0] f, input real s, output real v, output logic [4:0] fl);
+  function automatic void narrow(input logic [2:0] f, input real s, output real v, output logic [4:0] fl);
     int ex;
     big_t mx;
     if ((f == FMT_D) || (s == 0.0)) begin
@@ -336,7 +345,7 @@ module mantissa_fpu
   endfunction
 
   // fp._finalize
-  function automatic void finalize(input logic [1:0] f, input real value, input logic [4:0] fl,
+  function automatic void finalize(input logic [2:0] f, input real value, input logic [4:0] fl,
                                    input logic exact, output real v, output logic [4:0] out);
     real mn;
     v = value;
@@ -356,7 +365,7 @@ module mantissa_fpu
     err = (a - (s - bb)) + (b - bb);
   endfunction
 
-  function automatic void f_add(input logic [1:0] f, input real a, input real b, output real v,
+  function automatic void f_add(input logic [2:0] f, input real a, input real b, output real v,
                                 output logic [4:0] fl);
     real s, err, nv;
     logic [4:0] nfl;
@@ -376,7 +385,7 @@ module mantissa_fpu
     end
   endfunction
 
-  function automatic void f_mul(input logic [1:0] f, input real a, input real b, output real v,
+  function automatic void f_mul(input logic [2:0] f, input real a, input real b, output real v,
                                 output logic [4:0] fl);
     real p, nv;
     logic [4:0] nfl;
@@ -400,7 +409,7 @@ module mantissa_fpu
     end
   endfunction
 
-  function automatic void f_div(input logic [1:0] f, input real a, input real b, output real v,
+  function automatic void f_div(input logic [2:0] f, input real a, input real b, output real v,
                                 output logic [4:0] fl);
     real q, nv;
     logic [4:0] nfl;
@@ -436,7 +445,7 @@ module mantissa_fpu
     end
   endfunction
 
-  function automatic void f_sqrt(input logic [1:0] f, input real a, output real v, output logic [4:0] fl);
+  function automatic void f_sqrt(input logic [2:0] f, input real a, output real v, output logic [4:0] fl);
     real s, nv;
     logic [4:0] nfl;
     if (is_nan(a)) begin
@@ -464,7 +473,7 @@ module mantissa_fpu
   endfunction
 
   // fp.fma: a * b + c with a single rounding
-  function automatic void f_fma(input logic [1:0] f, input real a, input real b, input real c,
+  function automatic void f_fma(input logic [2:0] f, input real a, input real b, input real c,
                                 output real v, output logic [4:0] fl);
     real p, s, err, nv;
     logic [4:0] nfl;
@@ -515,7 +524,7 @@ module mantissa_fpu
   endfunction
 
   // fp.remainder: a - n * b with n the whole number nearest a / b
-  function automatic void f_rem(input logic [1:0] f, input real a, input real b, output real v,
+  function automatic void f_rem(input logic [2:0] f, input real a, input real b, output real v,
                                 output logic [4:0] fl);
     if (is_nan(a) || is_nan(b)) begin
       v = nan(); fl = 5'd0;
@@ -529,7 +538,7 @@ module mantissa_fpu
   endfunction
 
   // fp.fmod: what is left after trunc division
-  function automatic void f_mod(input logic [1:0] f, input real a, input real b, output real v,
+  function automatic void f_mod(input logic [2:0] f, input real a, input real b, output real v,
                                 output logic [4:0] fl);
     if (is_nan(a) || is_nan(b)) begin
       v = nan(); fl = 5'd0;
@@ -582,7 +591,7 @@ module mantissa_fpu
   // in integral().  |x / step| is num over den, exactly: q0 is its floor and
   // rm its remainder, so rm is to den as the fraction is to 1.  This is the
   // one place the reference divides by something that is not a power of two.
-  function automatic void on_grid(input logic [1:0] f, input int which, input real x, input real step,
+  function automatic void on_grid(input logic [2:0] f, input int which, input real x, input real step,
                                   output real v, output logic [4:0] fl);
     real ax, as;
     int ex, es;
@@ -660,7 +669,7 @@ module mantissa_fpu
 
   // ---- exponent surgery -------------------------------------------------------------
 
-  function automatic void scaleb(input logic [1:0] f, input real x, input real n, output real v,
+  function automatic void scaleb(input logic [2:0] f, input real x, input real n, output real v,
                                  output logic [4:0] fl);
     int ni, ex, est, p, emax, emin;
     big_t mx;
@@ -690,7 +699,7 @@ module mantissa_fpu
     end
   endfunction
 
-  function automatic void logb(input logic [1:0] f, input real x, output real v, output logic [4:0] fl);
+  function automatic void logb(input logic [2:0] f, input real x, output real v, output logic [4:0] fl);
     int e;
     real m;
     if (is_nan(x)) begin
@@ -706,7 +715,7 @@ module mantissa_fpu
     end
   endfunction
 
-  function automatic void nextafter(input logic [1:0] f, input real x, input real yv, output real v,
+  function automatic void nextafter(input logic [2:0] f, input real x, input real yv, output real v,
                                     output logic [4:0] fl);
     logic [63:0] w, mag;
     logic up;
@@ -743,7 +752,7 @@ module mantissa_fpu
     end
   endfunction
 
-  function automatic void classify(input logic [1:0] f, input real x, output real v, output logic [4:0] fl);
+  function automatic void classify(input logic [2:0] f, input real x, output real v, output logic [4:0] fl);
     real mn;
     fl = 5'd0;
     mn = min_normal(f);
@@ -770,7 +779,7 @@ module mantissa_fpu
   endfunction
 
   // fp.join: high + low, rounded once
-  function automatic void f_join(input logic [1:0] f, input real high, input real low, output real v,
+  function automatic void f_join(input logic [2:0] f, input real high, input real low, output real v,
                                output logic [4:0] fl);
     int eh, el;
     big_t mh, ml, mag;
@@ -827,14 +836,15 @@ module mantissa_fpu
 
   // ---- the operation ----------------------------------------------------------------------
 
-  function automatic void compute(input fpu_op_e o, input logic [1:0] f, input logic [1:0] f2,
-                                  input logic [1:0] cells, input logic [63:0] ab, input logic [63:0] bb,
-                                  input logic [63:0] cb, output logic [63:0] yv, output logic [63:0] y2v,
+  function automatic void compute(input fpu_op_e o, input logic [2:0] f, input logic [2:0] f2,
+                                  input logic [1:0] cells, input logic [127:0] ab, input logic [63:0] bb,
+                                  input logic [63:0] cb, output logic [127:0] yv, output logic [63:0] y2v,
                                   output logic [4:0] fl);
     real av, bv, cv, v, v2, tm, te;
-    logic [4:0] fl2;
-    logic [63:0] word;
-    av = r(ab);
+    logic [4:0] fl2, qi;
+    logic [63:0] word, qn_y;
+    longint unsigned qw_hi, qw_lo;
+    av = r(ab[63:0]);
     bv = r(bb);
     cv = r(cb);
     v2 = 0.0;
@@ -868,19 +878,36 @@ module mantissa_fpu
       F_CLASS:    classify(f, av, v, fl);
       F_LT, F_LE, F_EQ, F_CMP: compare(o, av, bv, v, fl);
       F_MOV:      begin v = av; fl = 5'd0; end
-      F_CVT:      convert(f, av, v, fl);
+      F_CVT: begin
+        if (f == FMT_Q) begin
+          // into quad: every double is exact there, so a widening is a bit
+          // shuffle -- sign, an 11-bit biased exponent grown to 15 bits, the
+          // 52-bit fraction at the bottom of quad's 112.  A NaN loses its
+          // payload: quad arithmetic answers with the one shared NaN.
+          c_q_widen(ab[63:0], qw_hi, qw_lo, qi);
+          yv = {qw_hi, qw_lo};
+          fl = qi;
+        end else if (f2 == FMT_Q) begin
+          // out of quad: one rounding over the 113-bit significand
+          c_q_narrow(ab[127:64], ab[63:0], int'(f), qn_y, qi);
+          yv = {64'd0, qn_y};
+          fl = qi;
+        end else begin
+          convert(f, av, v, fl);
+        end
+      end
       F_FROMBITS: begin
         word = 64'd0;
         fl = 5'd0;
         case (f)
           FMT_H:   word = {48'd0, ab[16 * (3 - int'(cells)) +: 16]};
           FMT_F:   word = {32'd0, ab[16 * (2 - int'(cells)) +: 32]};
-          default: word = ab;
+          default: word = ab[63:0];
         endcase
         v = from_bits(f, word);
       end
       F_TOBITS: begin
-        v = r(to_bits(f, av));
+        v = r(to_bits(f, av)[63:0]);
         fl = 5'd0;
       end
       F_SPLIT:    split(f, av, v, v2, fl);           // x is always a; only FMA reads c
@@ -893,16 +920,19 @@ module mantissa_fpu
       end
       default:    v = av;
     endcase
-    yv  = bits(v);
+    if (!(o == F_CVT && (f == FMT_Q || f2 == FMT_Q))) begin
+      yv = {64'd0, bits(v)};
+    end
     y2v = bits(v2);
   endfunction
 
   // ---- the interface ------------------------------------------------------------------------
 
-  fpu_op_e     op_r;
-  fmt_e        fmt_r, fmt2_r;
-  logic [1:0]  sel_r;
-  logic [63:0] a_r, b_r, c_r;
+  fpu_op_e      op_r;
+  fmt_e         fmt_r, fmt2_r;
+  logic [1:0]   sel_r;
+  logic [127:0] a_r;
+  logic [63:0]  b_r, c_r;
 
   always_ff @(posedge clk) begin
     if (!rst_n) begin
@@ -911,7 +941,7 @@ module mantissa_fpu
       fmt_r <= fmt_D;
       fmt2_r <= fmt_D;
       sel_r <= 2'd0;
-      a_r   <= 64'd0;
+      a_r   <= 128'd0;
       b_r   <= 64'd0;
       c_r   <= 64'd0;
     end else begin
@@ -930,7 +960,29 @@ module mantissa_fpu
 
   // the request is registered, so this runs once per request
   always_comb begin
-    compute(op_r, fmt_r, fmt2_r, sel_r, a_r, b_r, c_r, y, y2, flags);
+    // quad: this slice has the casts and the moves, not the arithmetic.  A
+    // quad MOV hands the 128 bits on, FROMBITS and TOBITS are the identity on
+    // a quad register's pattern (the core runs a quad load or store straight
+    // through memory and never asks), CVT answers exactly in both directions
+    // through compute, and every other operation on quad values answers the
+    // canonical quad NaN, or the shared double NaN when the answer stays
+    // narrow -- a defined answer nothing feeds: the core has no quad
+    // arithmetic either, and the fuzzer refuses operand codes 96 and up.
+    // Only MANT reads its second format, so fmt2 == Q routes by it alone:
+    // the port carries whatever the other operand field decoded, and the
+    // core keeps it honest for CVT by registering it.
+    if (fmt_r == FMT_Q && (op_r inside {F_MOV, F_FROMBITS, F_TOBITS})) begin
+      y = a_r;
+      y2 = 64'd0;
+      flags = 5'd0;
+    end else if ((fmt_r == FMT_Q || (fmt2_r == FMT_Q && op_r == F_MANT)) && op_r != F_CVT) begin
+      // no quad arithmetic yet
+      y = (fmt_r == FMT_Q) ? mantissa_pkg::QNAN_BITS : {64'd0, NAN_BITS};
+      y2 = 64'd0;
+      flags = 5'd0;
+    end else begin
+      compute(op_r, fmt_r, fmt2_r, sel_r, a_r, b_r, c_r, y, y2, flags);
+    end
   end
 
 endmodule
