@@ -47,9 +47,10 @@ def executed(record):
     for line in lines:
         if line.startswith("M "):
             _, _, _, address, width, bits = line.split()
-            packed = struct.pack(">d", struct.unpack("<d", bytes.fromhex(bits))[0])
-            for k in range(int(width)):  # a half or a float sits in the high cells of its double
-                memory[int(address) + k] = packed[2 * k] << 8 | packed[2 * k + 1]
+            value = int.from_bytes(bytes.fromhex(bits), "little")
+            for k in range(int(width)):  # cells are most significant first, whatever the width
+                shift = (int(width) - 1 - k) * 16
+                memory[int(address) + k] = value >> shift & 0xFFFF
         elif line.startswith("S "):
             pc = int(line.split()[2])
             word = struct.pack(">4H", *(memory.get(pc + k, 0) for k in range(4)))

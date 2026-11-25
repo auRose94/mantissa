@@ -405,6 +405,14 @@ def assemble(source, org=0):
             state.text(match[3], lineno)
         elif name == "SPACE":
             state.space(match[3], lineno)
+        elif name == "ALIGN":
+            try:
+                n = float(match[3])
+            except ValueError:
+                n = 0.0
+            if n <= 0 or n != int(n) or n > 65536:
+                raise AsmError(lineno, f"ALIGN needs a whole number of cells, not {match[3]!r}")
+            state.align(int(n))
         elif name in FORMS:
             state.instruction(name, suffix, match[3], lineno)
         else:

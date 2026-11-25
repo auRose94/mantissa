@@ -32,4 +32,14 @@
         LDI.Q  q0, 3037000500
         MUL.Q  q1, q0, q0
         PUT.Q  q1               ; 9223372037000250000: 2^63-ish, squared exactly,
-        HALT                    ; past what any double names
+                                ; past what any double names
+
+        LDI.F  f0, buf          ; a quad through memory: an eight-cell store,
+        ST.Q   [f0], q1         ; aligned on eight cells, and the value comes
+        LD.Q   q2, [f0]         ; back exact -- 9223372037000250000, from cells
+        PUT.Q  q2
+        HALT                    ; (a quad pointer can also name cells no float
+                                ;  can: tests/test_machine.py walks one past the
+                                ;  float wall, in a 2^25-cell memory)
+        ALIGN  8                 ; a quad needs an 8-cell boundary
+buf:   SPACE 8

@@ -254,6 +254,48 @@ class Addresses(unittest.TestCase):
         """)
         self.assertEqual(out.splitlines(), ["305.0", "2500.0"])
 
+    def test_quad_stores_and_loads_round_trip_through_memory(self):
+        out, cpu, _ = run("""
+            LDI.D  d0, 250
+            CVT.Q  q0, d0
+            LDI.F  f0, buf
+            ST.Q   [f0], q0
+            LDI.Q  q1, 999
+            LD.Q   q1, [f0]
+            PUT.Q  q1
+            HALT
+        ALIGN  8                    ; a quad needs an 8-cell boundary
+        buf:   SPACE 8
+        """)
+        self.assertEqual(out.splitlines(), ["250"])
+
+    def test_a_quad_pointer_names_cells_a_float_cannot(self):
+        out, cpu, _ = run("""
+            LDI.Q  q0, 16777217
+            LDI.H  h1, 777
+            ST.H   [q0], h1
+            LD.H   h2, [q0]
+            PUT.H  h2
+            LDI.Q  q3, 16777218
+            LD.H   h3, [q3]
+            PUT.H  h3
+            HALT
+        """, cells=2 ** 25)
+        self.assertEqual(out.splitlines(), ["777.0", "0.0"])
+
+    def test_a_fractional_quad_address_faults(self):
+        out, cpu, _ = run("""
+            LDI.D  d0, 2.5
+            CVT.Q  q0, d0
+            LDI.F  f0, buf
+            ST.H   [q0], h0
+            HALT
+        buf:   SPACE 8
+        """)
+        self.assertEqual(cpu.status, FAULT)
+        self.assertEqual(cpu.fault.kind, "address")
+        self.assertIn("not a whole number of cells", cpu.fault.detail)
+
     def test_a_float_pointer_slides_where_a_double_pointer_hits(self):
         # cell 2^24 + 1 exists in a big enough memory; no float can name it,
         # and a float pointer rounds silently onto the neighbour.  The same

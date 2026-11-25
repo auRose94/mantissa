@@ -1,6 +1,7 @@
 """Memory: a row of 16-bit cells, and nothing smaller."""
 from __future__ import annotations
 
+import math
 from array import array
 
 from . import fp
@@ -23,7 +24,19 @@ class Memory:
         self.cells = array("H", bytes(2 * size))
 
     def _index(self, width, addr, aligned):
-        addr = float(addr)  # the machine always hands over floats; tools may pass ints
+        if isinstance(addr, fp.Quad):
+            if addr.inf:
+                addr = math.inf
+            else:
+                exact = fp.q_fraction(addr)
+                # a quad address names a cell exactly when its value is a whole
+                # number: a double address stops at the float wall, a quad
+                # address does not have to
+                addr = exact if exact.denominator == 1 else float(exact)
+        elif isinstance(addr, fp.Qnan):
+            addr = math.nan
+        else:
+            addr = float(addr)  # the machine always hands over floats; tools may pass ints
         if addr != addr:
             reason = "NaN address"
         elif addr < 0:
@@ -40,12 +53,10 @@ class Memory:
 
     @staticmethod
     def _bits(cells, start, n):
-        if n == 1:
-            return cells[start]
-        if n == 2:
-            return cells[start] << 16 | cells[start + 1]
-        return (cells[start] << 48 | cells[start + 1] << 32
-                | cells[start + 2] << 16 | cells[start + 3])
+        bits = 0
+        for k in range(n):
+            bits = bits << 16 | cells[start + k]
+        return bits
 
     def check_fetch(self, addr):
         """Raise an address fault unless an instruction could be fetched at addr."""
