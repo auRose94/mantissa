@@ -54,7 +54,7 @@ replay() {                                  # replay <simulator> <label>
     for t in "$@"; do
         [ -f "$t" ] || { echo "FAIL (missing) $t"; failed=1; continue; }
         if [ "$(basename "$t")" = quad.trace ]; then
-            echo "skipped: $t -- the core has no quad register file yet"
+            echo "skipped: $t -- the core has no quad arithmetic yet (memory and casts are in; ADD and MUL on q are not)"
             continue
         fi
         "$sim" "$t" || failed=1
@@ -67,7 +67,7 @@ make -s all || { echo "build failed"; exit 1; }
 section "2. the FPU model against mantissa/fp.py, operation by operation"
 make -s test-fpu; keep $?
 
-section "3. the Mandelbrot, recorded by the reference"
+section "3. the Mandelbrot and quadmem, recorded by the reference"
 # the same command as PORTS.md gives, run from the copy's root; an existing
 # recording can be reused with MANDEL_TRACE=<file>
 if [ -n "${MANDEL_TRACE:-}" ] && [ -f "$MANDEL_TRACE" ]; then
@@ -77,9 +77,11 @@ else
     (cd "$ROOT" && python3 -m mantissa trace programs/mandel.mant --out fpga/$mandel) || { echo "could not record the Mandelbrot"; exit 1; }
 fi
 echo "recorded: $mandel"
+(cd "$ROOT" && python3 -m mantissa trace fpga/tools/quadmem.mant --out fpga/build/quadmem.trace) || { echo "could not record quadmem"; exit 1; }
+echo "recorded: build/quadmem.trace"
 
-section "4. golden/ and the Mandelbrot on the simulator with the FPU model"
-replay build/obj_model/m1_sim "$ROOT"/golden/*.trace "$mandel"
+section "4. golden/, the Mandelbrot and quadmem on the simulator with the FPU model"
+replay build/obj_model/m1_sim "$ROOT"/golden/*.trace "$mandel" build/quadmem.trace
 
 if [ -f rtl/synth/fpu_syn.sv ]; then
     section "5a. build: the simulator with the synthesizable FPU"
@@ -87,8 +89,8 @@ if [ -f rtl/synth/fpu_syn.sv ]; then
     if [ -x build/obj_syn/m1_sim ]; then
         section "5b. the synthesizable FPU against mantissa/fp.py, operation by operation"
         make -s test-fpu-syn; keep $?
-        section "5c. golden/ and the Mandelbrot on the simulator with the synthesizable FPU"
-        replay build/obj_syn/m1_sim "$ROOT"/golden/*.trace "$mandel"
+        section "5c. golden/, the Mandelbrot and quadmem on the synthesizable FPU"
+        replay build/obj_syn/m1_sim "$ROOT"/golden/*.trace "$mandel" build/quadmem.trace
     fi
 else
     echo
