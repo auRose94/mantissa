@@ -187,3 +187,86 @@ came up on the way:
   still holds its pre-instruction value.
 
 The fuzzer exercises the vector instructions along with everything else.
+
+## The q file on the core
+
+Quad is format 3: the format field widened from two bits to three, the four
+register codes 96 to 99 became q0 to q3, and `st_cells = 1 << fb` lands on
+eight -- but only once `st_cells` grows a fourth bit.  `3'd1 << 3'd3` is
+`3'd0`: the lane-width lesson again, caught this time before the run.
+
+The slice is memory and casts.  A quad store writes its two words of cells on
+two cycles and a quad load reads them the same way, most significant word
+first, no FPU and no `fpu_done` between them -- the state gate must not wait
+on `done` for a quad store, because none was raised and `done` never comes.
+LD.Q retires in ST_OPND, and the fetch the advance assumes has to go out
+there too: without it the next decode reads whatever the load's second word
+left in `mem_rdata`, which in quadmem was eight cells of data, and the core
+faulted on an instruction that was never fetched.
+
+A quad operand read for the 64-bit paths -- addresses, PUTC, the sources of
+the arithmetic the core does not have -- is the double the quad's value
+narrows to, one rounding, plus an exactness flag.  Any address a quad can
+name is small and whole and narrows exactly; a narrowing that loses bits is
+no address either (the true value is past the end, or not a whole number),
+so ST and LD fold the flag into their address checks and fault the same way
+the reference would.  PUTC does not fold it in: the reference narrows to a
+double there too and asks its questions of that.  The narrowing lives in
+`q_slice64`, the same mathematics as the model's `c_q_narrow` into D minus
+the flags; the reference crashes outright on an address held in a q register
+(`float()` of a Quad raises), so this is the port's own answer and nothing
+compares it.
+
+`fpu_fmt2` in ST_OPND is whatever the second operand field decodes from
+`mem_rdata` -- which is loaded data by then, not the instruction.  The core
+now registers `r_fmt2` at decode and the model routes on `fmt2 == Q` only
+for MANT, the one operation that reads its second format.  Before both of
+those, an `LD` of a half could answer the canonical NaN.
+
+## The reference loads a quad wrong
+
+`Memory._bits` has cases for one, two and four cells and falls through to
+the four-cell formula for everything else, so an eight-cell load assembles
+four cells into 64 bits and `q_from_bits` reads that as a subnormal quad.
+Every nonzero quad loaded from memory comes back as junk; a store is fine
+(it walks `fmt.cells`), so is a load of eight zero cells, which both
+machines read as +0.  `golden/quad.trace` never loads, which is why nobody
+met it.  `mantissa/` is not this port's to fix; the core implements the
+eight-cell assembly the machine specifies, and `tools/quadmem.mant` loads
+only zeroed cells.  When the reference is fixed, nothing here changes.
+
+## Quads compare by value, NaN tags and all
+
+The reference's quads are dataclasses and its `_same` is `a == b` for them,
+so a quad register changed when the 128 bits in it changed -- no object
+identity, no NaN tags.  The testbench keeps four quad registers in its
+shadow file and compares bits.  That only works because every quad value
+this slice writes is encoding-canonical: the widenings and the loads go
+through `q_from_bits` and `convert_into_q`, whose answers always are, so
+bit equality and dataclass equality never disagree.  The core still labels
+quad writes with provenance (FRESH for a load, INHERIT for a MOV, CANON for
+a cast) for the day arithmetic arrives; the testbench ignores it.
+
+## What the event port grew
+
+`ev_wval0`, `ev_sval` and `ev_putval` are 128 bits; `ev_wval1..3` stay at
+64 because only the first write of a step can be a quad, and a quad store
+or PUT is the only other thing that moves 128 bits.  `ev_putq` says when a
+PUT hands over a quad, so the testbench knows to print 32 hex digits: a
+quad +0 is all zeros and cannot be told from a double by looking.  An
+eight-cell store's width already rides in the M line's cell count.
+
+## What the model answers for quad
+
+Quad CVT goes through DPI: `c_q_widen` is a bit shuffle (a NaN loses its
+payload to the shared quad NaN; a subnormal double is a normal quad, far
+above quad's floor), `c_q_narrow` is `_round_ratio` over the 113-bit
+significand -- the shift to the quantum is always rightward and at least
+lead - p + 1, so guard and sticky bits are all that survive and no wide
+integer is needed.  A quad MOV, FROMBITS and TOBITS are the identity on the
+128 bits; everything else answers the canonical quad NaN, or the shared
+double NaN when the answer stays narrow.  Nothing feeds that: the core has
+no quad arithmetic, and the fuzzer refuses operand codes 96 and up (the
+ISA is legal; the file just is not on the core yet).  The fuzzer also
+refuses quad *values* in inline operands -- `fp.FORMATS` grew a Q, and a
+Quad cannot ride in a double literal.

@@ -80,10 +80,12 @@ class Program:
                                     0.1, 0.3, 1e-4, 1e10, 1e-30, 1e300, 5e-324, -5e-324, 2.0 ** -1022,
                                     2.0 ** -1074, 1.7976931348623157e308, 6.1e-5, 0.00006103515625 * 1.5])
         if r < 0.62:              # a NaN with a payload, of any format, widened
-            fmt = self.rng.choice(fp.FORMATS)
+            # half, float and double: a quad value is not a double, and the
+            # core has no quad arithmetic yet (the ISA is legal all the same)
+            fmt = self.rng.choice(fp.FORMATS[:3])
             return fp.from_bits(fmt, fmt.inf | (1 << (fmt.p - 2)) | self.rng.randrange(1 << (fmt.p - 2)))
         if r < 0.72:              # a value of a random format
-            fmt = self.rng.choice(fp.FORMATS)
+            fmt = self.rng.choice(fp.FORMATS[:3])   # no quads: see the NaN case above
             return fp.from_bits(fmt, self.rng.getrandbits(fmt.bits))
         return bits_dbl(self.rng.getrandbits(64) & 0x7FFFFFFFFFFFFFFF | (self.rng.getrandbits(1) << 63))
 
@@ -167,10 +169,11 @@ def broken_operand(program, name, spec):
                 break
         else:
             return None
-    elif which == 1:                      # a used field names nothing: 96 to 99
-        pos = rng.choice(spec.used or "a")
-        code = rng.randrange(96, 100)
-        a, b, c = {"a": (code, b, c), "b": (a, code, c), "c": (a, b, code)}[pos]
+    elif which == 1:
+        # codes 96 to 99 name q0 to q3 now: legal for the ISA, but the core
+        # has no quad arithmetic yet, so a program that uses them is not a
+        # fair differential.  Refused along with everything from 96 up.
+        return None
     elif which == 2 and spec.same_type:   # operands of mixed types
         fa, fb = rng.sample(FILES, 2)
         a, b = program.reg(fa), program.reg(fb)

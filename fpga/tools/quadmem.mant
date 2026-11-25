@@ -1,0 +1,63 @@
+; quadmem.mant -- the memory-and-cast slice of quad, the part the core runs.
+;
+; Stores doubles, widens them into q registers with CVT and LDI.Q, spills the
+; quads back out through eight-cell stores, narrows them down -- exact
+; everywhere but one rounding on the way down -- and PUTs the doubles.  What
+; this avoids is quad arithmetic, which the core does not have: ADD, MUL and
+; friends on q registers stay with the reference.
+;
+; It also avoids a reference fault of its own: Memory._bits assembles a load
+; with the four-cell formula whatever the format asks for, so a nonzero quad
+; loaded from memory comes back as subnormal junk (fpga/NOTES.md).  The load
+; here is of eight zero cells, which both machines read as +0.
+
+        LDI.D   d0, 6.5                ; a value every format holds exactly
+        LDI.F   f5, buf
+        ST      [f5], d0               ; the double, four cells
+        CVT.Q   q0, d0                 ; widen: sign, exponent, fraction -- a bit shuffle
+        LDI.F   f6, quadbuf
+        ST      [f6], q0               ; the quad, eight cells, most significant first
+        LDI.D   d1, 0.1
+        CVT.Q   q1, d1                 ; quad sees the double's true bits
+        ST      [f6], q1               ; spill again over the first
+        CVT.D   d2, q1                 ; down again, exact
+        PUT     d2                     ; 0.1's double, byte for byte
+
+        LDI.Q   q3, 1e300              ; a double literal widened at runtime
+        CVT.F   f1, q3                 ; down to float: past the top, an infinity
+        PUT     f1                     ; with overflow and inexact raised
+
+        LDI.Q   q0, 16777217           ; the float counting wall plus one
+        CVT.F   f2, q0                 ; halfway between two floats: to even
+        PUT     f2                     ; 16777216
+        CVT.D   d4, q0                 ; exact in double, no rounding at all
+        PUT     d4                     ; 16777217
+
+        LDI.D   d3, 1.5
+        CVT.Q   q1, d3
+        CVT.H   h1, q1                 ; down to half, exact
+        PUT     h1
+
+        LDI.D   d8, 5e-324             ; double's smallest subnormal
+        CVT.Q   q1, d8                 ; a normal quad, far above quad's floor
+        CVT.D   d9, q1                 ; and back, exact
+        PUT     d9
+
+        MOV     q2, q1                 ; a quad move hands the 128 bits on
+        CVT.D   d5, q2
+        PUT     d5
+
+        LDI.F   f7, zbuf
+        LD.Q    q2, [f7]               ; eight cells of zero: +0, byte for byte
+        CVT.D   d6, q2                 ; narrows to a signed zero
+        PUT     d6
+
+        LDI.Q   q1, 1234567890123456.0 ; exact as a double, exact in quad
+        CVT.D   d7, q1
+        PUT     d7
+        HALT
+
+buf:     SPACE  8                      ; the double lives here
+         DATA.Q 0                      ; eight zero cells, on an eight-cell boundary
+quadbuf: SPACE  8                      ; the quads go here
+zbuf:    SPACE  8                      ; and eight more for the load back

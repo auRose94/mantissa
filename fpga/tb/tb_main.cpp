@@ -39,9 +39,18 @@ namespace {
 constexpr int EV_RETIRE = 0, EV_HALT = 1, EV_FAULT = 2;
 constexpr int FAULT_ADDRESS = 0, FAULT_ILLEGAL = 1, FAULT_NOT_A_CHARACTER = 2;
 constexpr int PROV_CANON = 0, PROV_INHERIT = 1, PROV_FRESH = 2;
-constexpr int NREGS = 96;
+constexpr int NREGS = 100;     // h0..h31, f0..f31, d0..d31 and q0..q3 at 96
 constexpr int R_SP = 63;       // f31
-constexpr int NTAGS = 97;   // tags 1..97 name loaded NaNs; tag 0 is the shared one, or not a NaN
+constexpr int NTAGS = 101;  // tags 1..101 name loaded NaNs; tag 0 is the shared one, or not a NaN
+
+using word128 = unsigned __int128;
+
+// Verilator hands a 128-bit port over as four 32-bit words, least
+// significant first.
+word128 port128(const VlWide<4>& w) {
+  return (word128)(uint32_t)w[0] | ((word128)(uint32_t)w[1] << 32)
+       | ((word128)(uint32_t)w[2] << 64) | ((word128)(uint32_t)w[3] << 96);
+}
 
 struct Header {
   long long cells = 0, org = 0, entry = 0, sp = 0, image = 0;
@@ -135,9 +144,10 @@ uint64_t dbl_to_bits(double d) {
   return bits;
 }
 
-// A value in a trace is written the way the reference writes it,
-// struct.pack("<d", value).hex(): the double's eight bytes, least
-// significant first.
+// A value in a trace is written the way the reference writes it:
+// struct.pack("<d", value).hex() for the formats a double carries, and
+// to_bytes(16, "little") for quad -- the value's bytes, least significant
+// first, sixteen digits for a double, thirty-two for a quad.
 std::string hex16(uint64_t bits) {
   char buf[32];
   for (int i = 0; i < 8; i++)
@@ -145,25 +155,51 @@ std::string hex16(uint64_t bits) {
   return buf;
 }
 
-bool is_nan_bits(uint64_t bits) {
+std::string hex32(word128 bits) {
+  char buf[32];
+  for (int i = 0; i < 16; i++)
+    std::snprintf(buf + 2 * i, 3, "%02x", static_cast<unsigned>((bits >> (8 * i)) & 0xff));
+  return buf;
+}
+
+// A register changed is printed in the width its file holds.
+std::string hex_value(int code, word128 bits) {
+  return (code >= 96) ? hex32(bits) : hex16(static_cast<uint64_t>(bits));
+}
+
+bool is_nan64(uint64_t bits) {
   return ((bits >> 52) & 0x7ff) == 0x7ff && (bits & ((1ull << 52) - 1)) != 0;
 }
 
+bool is_nan128(word128 bits) {
+  return ((bits >> 112) & 0x7fff) == 0x7fff
+         && (bits & (((word128)1 << 112) - 1)) != 0;
+}
+
+bool is_nan_value(int code, word128 bits) {
+  return (code >= 96) ? is_nan128(bits) : is_nan64(static_cast<uint64_t>(bits));
+}
+
 std::string reg_name(int code) {
+  if (code >= 96) return "q" + std::to_string(code - 96);
   static const char kFiles[3] = {'h', 'f', 'd'};
   return std::string(1, kFiles[code >> 5]) + std::to_string(code & 31);
 }
 
 struct RegState {
-  uint64_t bits;
+  word128 bits;
   int tag;
 };
 
-// trace._same: the same object, or equal with the same sign of zero
-bool same(const RegState& a, const RegState& b) {
-  if (is_nan_bits(a.bits) || is_nan_bits(b.bits))
-    return is_nan_bits(a.bits) && is_nan_bits(b.bits) && a.tag == b.tag;
-  return a.bits == b.bits;
+// trace._same: the same object, or equal with the same sign of zero.  Quad
+// registers compare by value: the reference's quads are dataclasses and its
+// _same is `a == b` for them, so bits decide and the NaN tags play no part.
+bool same(int code, const RegState& a, const RegState& b) {
+  if (code >= 96) return a.bits == b.bits;
+  const uint64_t ab = static_cast<uint64_t>(a.bits), bb = static_cast<uint64_t>(b.bits);
+  if (is_nan64(ab) || is_nan64(bb))
+    return is_nan64(ab) && is_nan64(bb) && a.tag == b.tag;
+  return ab == bb;
 }
 
 const char* fault_name(int kind) {
@@ -251,7 +287,7 @@ int run_one(const std::string& in_path, const Options& opt) {
   std::vector<std::string> out;
   RegState shadow[NREGS];
   for (int i = 0; i < NREGS; i++) shadow[i] = {0, 0};
-  shadow[R_SP] = {dbl_to_bits(static_cast<double>(h.sp)), 0};   // f31 starts at the stack pointer
+  shadow[R_SP] = {(word128)dbl_to_bits(static_cast<double>(h.sp)), 0};   // f31 starts at the stack pointer
 
   long long steps = 0;
   const auto t0 = std::chrono::steady_clock::now();
@@ -268,18 +304,19 @@ int run_one(const std::string& in_path, const Options& opt) {
       // register writes: the new tags come from the state before the step
       const int nwr = dut->ev_nwr;
       int code[4] = {dut->ev_wcode0, dut->ev_wcode1, dut->ev_wcode2, dut->ev_wcode3};
-      uint64_t val[4] = {dut->ev_wval0, dut->ev_wval1, dut->ev_wval2, dut->ev_wval3};
+      word128 val[4] = {port128(dut->ev_wval0), (word128)dut->ev_wval1,
+                        (word128)dut->ev_wval2, (word128)dut->ev_wval3};
       int prov[4] = {dut->ev_wprov0, dut->ev_wprov1, dut->ev_wprov2, dut->ev_wprov3};
       int src[4] = {dut->ev_wsrc0, dut->ev_wsrc1, dut->ev_wsrc2, dut->ev_wsrc3};
       int tag[2] = {0, 0};
       for (int i = 0; i < nwr && i < 4; i++) {
         if (code[i] >= NREGS) { std::fprintf(stderr, "m1_sim: bad register code %d\n", code[i]); return 1; }
-        if (!is_nan_bits(val[i])) continue;
+        if (!is_nan_value(code[i], val[i])) continue;
         if (prov[i] == PROV_INHERIT) {
           tag[i] = shadow[src[i]].tag;
         } else if (prov[i] == PROV_FRESH) {
           // a new object: a tag no register holds, the one being written included,
-          // since the new NaN is never the NaN that was there (96 registers, 97 tags)
+          // since the new NaN is never the NaN that was there (100 registers, 101 tags)
           bool used[NTAGS + 1] = {};
           for (int r = 0; r < NREGS; r++) used[shadow[r].tag] = true;
           tag[i] = 0;
@@ -299,19 +336,24 @@ int run_one(const std::string& in_path, const Options& opt) {
       // file by file, by register number within a file: the register code's order
       for (int r = 0; r < NREGS; r++) {
         if (!touched[r]) continue;
-        if (!same(before[r], shadow[r])) {
-          out.push_back("R " + where + " " + reg_name(r) + " " + hex16(shadow[r].bits));
+        if (!same(r, before[r], shadow[r])) {
+          out.push_back("R " + where + " " + reg_name(r) + " " + hex_value(r, shadow[r].bits));
           changed = true;
         }
       }
 
       if (dut->ev_store) {
+        const int cells = 1 << dut->ev_sfmt;
         out.push_back("M " + where + " " + std::to_string(dut->ev_saddr) + " "
-                      + std::to_string(1 << dut->ev_sfmt) + " " + hex16(dut->ev_sval));
+                      + std::to_string(cells) + " "
+                      + (cells == 8 ? hex32(port128(dut->ev_sval))
+                                    : hex16(static_cast<uint64_t>(port128(dut->ev_sval)))));
         changed = true;
       }
       if (dut->ev_put) {
-        out.push_back("P " + where + " " + hex16(dut->ev_putval));
+        out.push_back("P " + where + " "
+                      + (dut->ev_putq ? hex32(port128(dut->ev_putval))
+                                      : hex16(static_cast<uint64_t>(port128(dut->ev_putval)))));
         changed = true;
       }
       if (dut->ev_putc) {
