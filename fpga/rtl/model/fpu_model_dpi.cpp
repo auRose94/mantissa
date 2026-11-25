@@ -8,6 +8,49 @@
 #include <cstring>
 #include <limits>
 
+#include "quad_fp.h"
+
+namespace {
+
+// narrow bit patterns, as the machine stores them: a half or a float held in
+// a 64-bit word's low bits
+double narrow_value(int fmt, uint64_t bits) {
+  if (fmt == 0) {  // half
+    uint16_t h = static_cast<uint16_t>(bits);
+    _Float16 f = *reinterpret_cast<_Float16*>(&h);
+    return static_cast<double>(f);
+  }
+  if (fmt == 1) {  // float
+    uint32_t u = static_cast<uint32_t>(bits);
+    float f;
+    std::memcpy(&f, &u, sizeof f);
+    return static_cast<double>(f);
+  }
+  return m1::double_of(bits);  // double
+}
+
+uint64_t narrow_bits(int fmt, double x) {
+  if (fmt == 0) {  // half: one rounding
+    _Float16 h = static_cast<_Float16>(x);
+    uint16_t u;
+    std::memcpy(&u, &h, sizeof u);
+    return u;
+  }
+  if (fmt == 1) {  // float: one rounding
+    float f = static_cast<float>(x);
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof u);
+    return u;
+  }
+  return m1::bits_of(x);
+}
+
+m1::QRes quad_from_narrow(int fmt, uint64_t bits) {
+  return m1::q_from_double(narrow_value(fmt, bits));  // every narrow value is exact in quad
+}
+
+}  // namespace
+
 extern "C" {
 
 double c_fma(double x, double y, double z) { return std::fma(x, y, z); }
@@ -160,6 +203,122 @@ void c_q_narrow(uint64_t ahi, uint64_t alo, int dst, uint64_t* y, int* flags) {
   uint64_t bits;
   std::memcpy(&bits, &d, sizeof bits);
   *y = bits;
+}
+
+
+// Quad arithmetic: the whole operation dispatches to the software binary128
+// -- the same engine the HIP port runs (copied to quad_fp.h above), so the
+// two ports answer round for round, and the fpu vectors hold both to the
+// reference.  Operands arrive as hi/lo pairs; a narrow operand in a mixed
+// cast arrives in its low word with fmt telling the truth, and every narrow
+// value is exact in quad, so widening is a value copy.
+void c_quad_op(int op, int f, int f2,
+               unsigned long long ahi, unsigned long long alo,
+               unsigned long long bhi, unsigned long long blo,
+               unsigned long long chi, unsigned long long clo,
+               unsigned long long* yhi, unsigned long long* ylo,
+               unsigned long long* y2hi, unsigned long long* y2lo, int* flags) {
+  m1::QRes r{m1::QNAN_HI, m1::QNAN_LO, 0};
+  uint64_t m2 = 0;        // the second answer (SPLIT's low, MANT's exponent)
+  uint64_t m2_hi = 0;     // its high word: quads answer in full
+  switch (op) {
+    case 0:  r = m1::q_add_bits(ahi, alo, bhi, blo); break;
+    case 1:  r = m1::q_sub_bits(ahi, alo, bhi, blo); break;
+    case 2:  r = m1::q_mul_bits(ahi, alo, bhi, blo); break;
+    case 3:  r = m1::q_div_bits(ahi, alo, bhi, blo); break;
+    case 4:  r = m1::q_sqrt_bits(ahi, alo); break;
+    case 5:  r = m1::q_fma_bits(ahi, alo, bhi, blo, chi, clo); break;  // a*b + c
+    case 6:  r = m1::q_rem_bits(ahi, alo, bhi, blo, 0); break;
+    case 7:  r = m1::q_rem_bits(ahi, alo, bhi, blo, 1); break;
+    case 8:  r = m1::q_min_bits(ahi, alo, bhi, blo); break;
+    case 9:  r = m1::q_max_bits(ahi, alo, bhi, blo); break;
+    case 10: r = m1::q_neg_bits(ahi, alo); break;
+    case 11: r = m1::q_abs_bits(ahi, alo); break;
+    case 12: r = m1::q_copysign_bits(ahi, alo, bhi, blo); break;
+    case 13: r = m1::q_integral_bits(0, ahi, alo); break;
+    case 14: r = m1::q_integral_bits(1, ahi, alo); break;
+    case 15: r = m1::q_integral_bits(2, ahi, alo); break;
+    case 16: r = m1::q_integral_bits(3, ahi, alo); break;
+    case 17: r = m1::q_grid_bits(0, ahi, alo, bhi, blo); break;
+    case 18: r = m1::q_grid_bits(1, ahi, alo, bhi, blo); break;
+    case 19: r = m1::q_grid_bits(2, ahi, alo, bhi, blo); break;
+    case 20: r = m1::q_grid_bits(3, ahi, alo, bhi, blo); break;
+    case 21: r = m1::q_scalb_bits(ahi, alo, bhi, blo); break;
+    case 22: r = m1::q_logb_bits(ahi, alo); break;
+    case 23: r = m1::q_next_bits(ahi, alo, bhi, blo); break;
+    case 24: r = m1::q_class_bits(ahi, alo); break;
+    case 25: r = m1::q_lt_bits(ahi, alo, bhi, blo); break;
+    case 26: r = m1::q_le_bits(ahi, alo, bhi, blo); break;
+    case 27: r = m1::q_eq_bits(ahi, alo, bhi, blo); break;
+    case 28: r = m1::q_cmp_bits(ahi, alo, bhi, blo); break;
+    case 32: {  // SPLIT: f names the halves' file
+      const bool a_exp_all_ones = ((ahi >> 48) & 0x7fff) == 0x7fff;
+      const bool a_is_qnan = a_exp_all_ones && ((ahi & 0x0000ffffffffffffULL) || alo);
+      if (a_is_qnan) {
+        // fp.py: a NaN splits into the quad canonical NaN, both halves, no flags
+        r = m1::QRes{m1::QNAN_HI, m1::QNAN_LO, 0};
+        m2_hi = m1::QNAN_HI; m2 = m1::QNAN_LO;
+        break;
+      }
+      const bool a_is_qinf = a_exp_all_ones
+                             && (ahi & 0x0000ffffffffffffULL) == 0 && alo == 0;
+      if (a_is_qinf) {
+        // an infinity splits into itself, both halves, no flags
+        const unsigned long long inf_bits = (ahi >> 63) ? 0xfff0000000000000ULL
+                                                        : 0x7ff0000000000000ULL;
+        if (f == 3) r = m1::QRes{ahi, alo, 0};
+        else { r = m1::QRes{0, inf_bits, 0}; m2 = inf_bits; }
+        break;
+      }
+      if (f == 3) {  // into quad: exact, the low half is the quad zero
+        r = m1::QRes{ahi, alo, 0};
+        m2_hi = 0; m2 = 0;
+        break;
+      }
+      // out of quad: high is one rounding, low narrows the exact leavings;
+      // the split's flag is exact exactly when narrowing the low lost
+      // nothing and the leavings did not run away to an infinity
+      uint64_t hb = 0;
+      int hf = 0;
+      c_q_narrow(ahi, alo, f, &hb, &hf);
+      m1::QRes wide_back = quad_from_narrow(f, hb);
+      m1::QRes rest = m1::q_sub_bits(ahi, alo, wide_back.hi, wide_back.lo);
+      uint64_t lb = 0;
+      int lf = 0;
+      c_q_narrow(rest.hi, rest.lo, f, &lb, &lf);
+      const bool leavings_finite = ((rest.hi >> 48) & 0x7fff) != 0x7fff;
+      const bool exact = (lf & 0x10) == 0 && leavings_finite;
+      r = m1::QRes{0, hb, exact ? 0u : 0x10u};
+      m2 = lb;
+      break;
+    }
+    case 33: {  // JOIN: f names the destination's file; the parts may be narrow or quad
+      m1::QRes hi_part = (f2 == 3) ? m1::QRes{ahi, alo, 0} : quad_from_narrow(f2, ahi);
+      m1::QRes lo_part = (f2 == 3) ? m1::QRes{bhi, blo, 0} : quad_from_narrow(f2, bhi);
+      r = m1::q_join_bits(f, hi_part.hi, hi_part.lo, lo_part.hi, lo_part.lo);
+      break;
+    }
+    case 34: {  // MANT: m in f's format, e in f2's
+      m1::QRes m = m1::q_mant_m_bits(ahi, alo);
+      m1::QRes e = m1::q_mant_e_bits(ahi, alo);
+      r = m;
+      if (f2 == 3) {
+        m2_hi = e.hi; m2 = e.lo;
+      } else {
+        uint64_t eb = 0; int ef = 0;
+        c_q_narrow(e.hi, e.lo, f2, &eb, &ef);
+        m2 = eb;
+      }
+      break;
+    }
+    case 35: r = m1::QRes{ahi, alo, 0}; break;  // MOV
+    default: r = m1::q_qnan(); break;
+  }
+  *yhi = r.hi;
+  *ylo = r.lo;
+  *y2hi = m2_hi;
+  *y2lo = m2;
+  *flags = static_cast<int>(r.flags);
 }
 
 }  // extern "C"

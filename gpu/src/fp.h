@@ -16,9 +16,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <cmath>
-#include <cstdio>
-#include <cstdio>
 
 // M1_HD marks a function that HIP must build for the device as well as the host.
 #if defined(__HIP__)
@@ -1197,12 +1196,22 @@ M1_HD inline QRounded q_round(int fmt, Qacc& acc, int tail) {
             }
             int lowb = off + bl - W;  // the piece's bits under the window bottom
             u128 inw;
-            if (lowb <= 0) {
-                inw = lowb == 0 ? k.m : (k.m << (unsigned)(-lowb));
-            } else {
-                inw = lowb < 128 ? (k.m >> (unsigned)lowb) : 0;
-                u128 cut = lowb < 128 ? (k.m & (((u128)1 << (unsigned)lowb) - 1)) : k.m;
+            if (lowb < 0 && off >= -W + 1) {
+                // the piece straddles the window bottom: its top part stays
+                // in the window, its low part is under-window mass
+                inw = k.m >> (unsigned)(-lowb);
+                u128 cut = k.m & (((u128)1 << (unsigned)(-lowb)) - 1);
                 if (cut) qacc_push(below, cut, k.e, k.neg);
+            } else if (lowb < 0) {
+                qacc_push(below, k.m, k.e, k.neg);   // entirely under the window
+                continue;
+            } else {
+                // fully inside: shift the piece's top to its own position.
+                // The top belongs at window index W-1+off; m's top is at
+                // bl-1; the shift is W+off-bl -- the old code shifted by
+                // W-off-bl, correct only for the piece at the very top and
+                // silently dropping or corrupting every other piece.
+                inw = k.m << (unsigned)(W + off - bl);
             }
             win += k.neg ? -(s128)inw : (s128)inw;
         }
@@ -1213,9 +1222,6 @@ M1_HD inline QRounded q_round(int fmt, Qacc& acc, int tail) {
             bool wneg = win < 0;
             u128 mag = (u128)(wneg ? -win : win);
 #ifdef M1_TRACE
-            std::printf("[qround] T %d mag %llx%llx bt %d n %d b0 %llx\n", T,
-                        (unsigned long long)(mag >> 64), (unsigned long long)mag, bt, acc.n,
-                        acc.n ? (unsigned long long)acc.c[0].m : 0ull);
 #endif
             out.neg = wneg;
             // a window of exactly a power of two with mass taken out from
@@ -1251,7 +1257,17 @@ M1_HD inline QRounded q_round(int fmt, Qacc& acc, int tail) {
                 uint32_t gb = (uint32_t)gbv;
                 bool up;
                 if (gb > 2) up = true;
-                else if (gb < 2) up = false;
+                else if (gb == 1 && !bl.zero && bt > 0
+                         && q_cmp_pow2(bl.m, bl.e - bot + 1, 0) >= 0) {
+                    // the truncation sits a quarter low, but the under-window
+                    // mass carries at least another quarter: past the midpoint
+                    up = true;
+                } else if (gb == 0 && !bl.zero && bt > 0
+                           && q_cmp_pow2(bl.m, bl.e - bot + 1, 1) > 0) {
+                    // three quarters or more of under-window mass: past the
+                    // midpoint the same way
+                    up = true;
+                } else if (gb < 2) up = false;
                 else {
                     // at the midpoint the under-window mass decides: mass that
                     // adds to the magnitude pushes past it, mass that shaves
@@ -1381,7 +1397,6 @@ M1_HD inline QRounded q_ratio_round(int fmt, u128 num, u128 den, int K, bool sti
     int qe = est - p + 1 > quantum ? est - p + 1 : quantum;
     int s = K - qe;
 #ifdef M1_TRACE
-    std::printf("[ratio] fmt %d bln %d bld %d est %d qe %d s %d den==1 %d\n", fmt, bln, bld, est, qe, s, (int)(den == 1));
 #endif
     u128 q, r;
     int s_left = 0;
@@ -1407,7 +1422,6 @@ M1_HD inline QRounded q_ratio_round(int fmt, u128 num, u128 den, int K, bool sti
         q = H / den;
         if (den == 1) {
 #ifdef M1_TRACE
-            std::printf("[else1] k %d div_shift %d\n", k, qe - K);
 #endif
             // my denominator folded the exponent, so fp.py's remainder
             // (num * 2**k) mod 2**(-K) is nonzero exactly when num carries
@@ -1425,7 +1439,6 @@ M1_HD inline QRounded q_ratio_round(int fmt, u128 num, u128 den, int K, bool sti
     }
     bool inexact = sticky || inexact_tail;
 #ifdef M1_TRACE
-    std::printf("[ratio2] r %llx inexact %d\n", (unsigned long long)r, (int)inexact);
 #endif
     int cmp = q_cmp_pow2(r, s_left + 1, den);
     bool up = cmp > 0 || (cmp == 0 && (q & 1));
@@ -1519,8 +1532,7 @@ M1_HD inline QRes q_cmp_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl)
     // fp.py's Quad(0, -1) carries a negative significand and its bits go
     // negative, past what a trace can print; the same value as a 128-bit
     // pattern is its two's complement.
-    u128 m = o == 0 ? 0 : (o > 0 ? 1 : ~(u128)0);
-    return q_encode_raw(0, m, 0);
+    return q_encode_raw(o < 0 ? 1 : 0, o == 0 ? 0 : 1, 0);
 }
 M1_HD inline QRes q_lt_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
     Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
@@ -1760,8 +1772,9 @@ M1_HD inline int q_trunc_exp(const Qdec& n) {  // the quad n as a whole exponent
 
 M1_HD inline QRes q_scalb_bits(uint64_t xh, uint64_t xl, uint64_t nh, uint64_t nl) {
     Qdec x = q_decode(xh, xl), n = q_decode(nh, nl);
-    if (x.kind == 3 || n.kind == 3) return q_qnan();
+    if (x.kind == 3) return q_qnan();
     if (x.kind == 0 || x.kind == 2) return QRes{xh, xl, 0};
+    if (n.kind == 3) return q_qnan();
     int nn = q_trunc_exp(n);
     return q_ratio_quad(x.sign, x.m, 1, x.e + nn);
 }
@@ -2023,7 +2036,7 @@ M1_HD inline Result q_to_fmt(int dst, uint64_t hi, uint64_t lo) {
 M1_HD inline QRes q_from_double(double x) {
     if (is_nan(x)) return q_qnan();
     if (x == 0.0) return q_encode_raw(sign_bit(x), 0, 0);
-    if (is_inf(x)) return q_encode_raw(sign_bit(x), 0, 0);
+    if (is_inf(x)) return q_inf_bits(sign_bit(x), 0);
     Dyad d = canon(x);
     return q_encode_canon(sign_bit(x), (u128)d.odd, d.exp);
 }

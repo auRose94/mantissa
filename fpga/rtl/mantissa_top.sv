@@ -80,7 +80,7 @@ module mantissa_top
   logic [2:0]            fpu_fmt, fpu_fmt2;
   logic [1:0]            fpu_sel;
   logic [127:0]          fpu_a, fpu_y;
-  logic [63:0]           fpu_b, fpu_c, fpu_y2;
+  logic [127:0]          fpu_b, fpu_c, fpu_y2;
   logic [4:0]            fpu_flags;
 
   mantissa_core

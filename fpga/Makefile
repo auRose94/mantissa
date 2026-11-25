@@ -36,8 +36,8 @@ $(BUILD)/obj_fpu_model/tb_fpu: rtl/mantissa_pkg.sv $(MODEL) tb/tb_fpu.cpp
 	    -Mdir $(dir $@) rtl/mantissa_pkg.sv $(MODEL) tb/tb_fpu.cpp -o tb_fpu
 
 # ---- tests ------------------------------------------------------------------------
-$(BUILD)/fpu_vectors.txt: tools/gen_fpu_vectors.py
-	$(PYTHON) tools/gen_fpu_vectors.py --out $@ --count 150000
+$(BUILD)/fpu_vectors.txt: tools/gen_fpu_vectors.py ../mantissa/fp.py ../mantissa/machine.py
+	$(PYTHON) tools/gen_fpu_vectors.py --out $@ --count 150000 --seed 4
 
 test-fpu: $(BUILD)/obj_fpu_model/tb_fpu $(BUILD)/fpu_vectors.txt
 	$(BUILD)/obj_fpu_model/tb_fpu $(BUILD)/fpu_vectors.txt

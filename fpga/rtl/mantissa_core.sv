@@ -52,11 +52,11 @@ module mantissa_core
   output logic [2:0]              fpu_fmt2,          // the second format: JOIN's parts, MANT's exponent
   output logic [1:0]               fpu_sel,           // for F_FROMBITS: which cell of a word the value is in
   output logic [127:0]             fpu_a,             // a quad operand in full, a narrow one in the low 64
-  output logic [63:0]              fpu_b,
-  output logic [63:0]              fpu_c,
+  output logic [127:0]             fpu_b,
+  output logic [127:0]             fpu_c,
   input  logic                     fpu_done,
   input  logic [127:0]             fpu_y,             // a quad result in full, a narrow one in the low 64
-  input logic [63:0]               fpu_y2,            // SPLIT's low half, MANT's exponent
+  input logic [127:0]              fpu_y2,            // SPLIT's low half, MANT's exponent (quad when fmt2 is Q)
   input  logic [4:0]               fpu_flags,
 
   // status
@@ -804,8 +804,8 @@ module mantissa_core
     fpu_fmt2 = mantissa_pkg::fmt_e'(fb);
     fpu_sel = 2'd0;
     fpu_a = {64'd0, rb};
-    fpu_b = 64'd0;
-    fpu_c = 64'd0;
+    fpu_b = 128'd0;
+    fpu_c = 128'd0;
     case (state)
       ST_DECODE: begin
         if (dec_go) fpu_start = (d_cls == C_ALU) || (d_cls == C_VEC) || (d_cls == C_ST)
@@ -818,8 +818,10 @@ module mantissa_core
             fpu_a = ((d_fop == mantissa_pkg::F_SPLIT) || (d_fop == mantissa_pkg::F_MANT))
                     ? ((fc == mantissa_pkg::FMT_Q) ? qregs[d_c[1:0]] : {64'd0, rc})
                     : ((fb == mantissa_pkg::FMT_Q) ? qregs[d_b[1:0]] : {64'd0, rb});
-            fpu_b = rc;
-            fpu_c = ra;                          // FMA's addend is its own destination
+            // a quad operand travels whole: the whole file is the type
+            fpu_b = (fc == mantissa_pkg::FMT_Q) ? qregs[d_c[1:0]] : {64'd0, rc};
+            fpu_c = (fa == mantissa_pkg::FMT_Q) ? qregs[d_a[1:0]] : {64'd0, ra};
+                                                 // FMA's addend is its own destination
           end
           C_ST: begin
             // a quad store carries its own bits: no request, no cells
@@ -1193,7 +1195,8 @@ module mantissa_core
                 // whole answer; the narrow files take the low 64 bits
                 if (r_fmt == mantissa_pkg::FMT_Q) qregs[r_a[1:0]] <= fpu_y;
                 else regs[r_a] <= fpu_y[63:0];
-                if (r_wb2) regs[r_b] <= fpu_y2;            // SPLIT and MANT never write a quad first
+                if (r_wb2 && r_fmt2 == mantissa_pkg::FMT_Q) qregs[r_b[1:0]] <= fpu_y2;
+                else if (r_wb2) regs[r_b] <= fpu_y2;       // SPLIT and MANT never write a quad first
                 if (r_setflags) flags <= flags | fpu_flags;
                 ev_nwr <= r_wb2 ? 3'd2 : 3'd1;
                 ev_wcode0 <= r_a;

@@ -57,7 +57,7 @@ assert set(_BINARY.values()) == set(BINARY)
 assert set(_UNARY.values()) == set(UNARY)
 
 FORMATS = (fp.H, fp.F, fp.D)
-FMT = {"H": 0, "F": 1, "D": 2}
+FMT = {"H": 0, "F": 1, "D": 2, "Q": 3}
 
 
 def hex64(value):
@@ -171,11 +171,104 @@ def one(value, flags):
     return value, 0.0, flags
 
 
+def hex128(value):
+    """The 128 bits of a quad value, most significant word first."""
+    return f"{fp.to_bits(fp.Q, value):032x}"
+
+
+def quad_constants():
+    """Quad values worth trying: the corners of the 128-bit pattern, plus a
+    spread of normals, subnormals, the counting wall, and both zeros."""
+    patterns = [0, 1, fp.Q.sign, fp.Q.sign | 1,
+                fp.Q.inf, fp.Q.inf | fp.Q.sign,
+                fp.Q.inf - 1, fp.Q.inf - 2,
+                (fp.Q.inf | (1 << 110)),                      # quiet NaN, a payload
+                (fp.Q.sign | fp.Q.inf | 1),                   # signalling and negative
+                1 << 112, (1 << 112) - 1,                     # smallest normal, largest subnormal
+                (1 << 112) | (1 << 60),                       # a normal with a mark
+                3, 5, (1 << 111), fp.Q.sign | (1 << 112)]
+    values = [fp.from_bits(fp.Q, b) for b in patterns]
+    wall = (16496 << 112) | ((1 << 112) - 1)                     # 2**113 - 1: one under the binade
+    values += [fp.from_bits(fp.Q, 16496 << 112),                 # 2**113, above the wall
+               fp.from_bits(fp.Q, wall), fp.from_bits(fp.Q, fp.Q.sign | wall),
+               fp.convert_into_q(1e30)[0], fp.convert_into_q(-1e30)[0],
+               fp.Quad(0, 1, -16494), fp.Quad(1, 1, -16494)]     # subnormals, normalized
+    return values
+
+
+def q_sample(pool, rng):
+    """A quad operand: corners, whole normals at any exponent, and raw bits."""
+    roll = rng.random()
+    if roll < 0.45:
+        return rng.choice(pool)
+    if roll < 0.75:
+        m = (1 << 112) | rng.getrandbits(112)
+        e = rng.randrange(-16494, 16384 - 113)
+        return fp.Quad(rng.randrange(2), m, e)
+    return fp.from_bits(fp.Q, rng.getrandbits(128))
+
+
+def add_quad(self, op, a, b, c, result, fmt2="Q"):
+    """A quad request: a, b and c as 128-bit operands; the answer y is a
+    quad when the operation answers in quad, and value2 rides as its own
+    width -- a narrow answer is sixteen digits, a quad thirty-two."""
+    if result is None:
+        return
+    value, value2, flags = result
+    vh = hex128(value) if isinstance(value, (fp.Quad, fp.Qnan)) else hex64(value)
+    v2h = (hex128(value2) if isinstance(value2, (fp.Quad, fp.Qnan))
+           else (hex64(value2) if isinstance(value2, float) else f"{value2 & 0xFFFFFFFFFFFFFFFF:016x}"))
+    ah = hex128(a) if isinstance(a, (fp.Quad, fp.Qnan)) else hex64(a)
+    bh = hex128(b) if isinstance(b, (fp.Quad, fp.Qnan)) else hex64(b)
+    ch = hex128(c) if isinstance(c, (fp.Quad, fp.Qnan)) else hex64(c)
+    self.lines.append(f"{OP[op]} 3 {FMT[fmt2]} 0 {ah} {bh} {ch} {vh} {v2h} {flags:02x}")
+
+Writer.add_quad = add_quad
+
+
 def generate(seed, count):
     rng = random.Random(seed)
     pools = {fmt.name: constants(fmt) for fmt in FORMATS}
     w = Writer()
     per = max(2, count // 150)
+
+    # --- quad: binary128, through the same opcodes the narrow formats use
+    qpool = quad_constants()
+    for fn, key in BINARY.items():
+        for _ in range(per):
+            x, y = q_sample(qpool, rng), q_sample(qpool, rng)
+            answer = w.call(key, fp.Q, fn, x, y)
+            if answer:
+                w.add_quad(key, x, y, 0.0, one(*answer))
+    for fn, key in UNARY.items():
+        for _ in range(per):
+            x = q_sample(qpool, rng)
+            answer = w.call(key, fp.Q, fn, x)
+            if answer:
+                w.add_quad(key, x, 0.0, 0.0, one(*answer))
+    for _ in range(per):
+        a, b, c = (q_sample(qpool, rng) for _ in range(3))
+        answer = w.call("FMA", fp.Q, fp.fma, a, b, c)
+        if answer:
+            w.add_quad("FMA", a, b, c, one(*answer))
+    for _ in range(per // 2):
+        x = q_sample(qpool, rng)
+        dst = rng.choice([fp.H, fp.F, fp.D])
+        value, flags = fp.convert(dst, x)
+        w.lines.append(f"{OP['CVT']} {FMT[dst.name]} 3 0 {hex128(x)} "
+                       f"{'0' * 32} {'0' * 32} {hex64(value)} {'0' * 16} {flags:02x}")
+    for _ in range(per // 4):
+        dst = rng.choice([fp.H, fp.F, fp.D])
+        xd = sample(dst, rng, pools[dst.name])
+        value, flags = fp.convert(fp.Q, xd)
+        w.lines.append(f"{OP['CVT']} 3 {FMT[dst.name]} 0 {hex64(xd)} "
+                       f"{'0' * 32} {'0' * 32} {hex128(value)} {'0' * 16} {flags:02x}")
+    for _ in range(per // 2):
+        x = q_sample(qpool, rng)
+        high, low, flags = fp.split(fp.D, x)
+        w.lines.append(f"{OP['SPLIT']} 2 3 0 {hex128(x)} {'0' * 32} {'0' * 32} "
+                       f"{hex64(high) if not isinstance(high, (fp.Quad, fp.Qnan)) else hex128(high)} "
+                       f"{hex64(low) if not isinstance(low, (fp.Quad, fp.Qnan)) else hex128(low)} {flags:02x}")
 
     for fmt in FORMATS:
         pool = pools[fmt.name]

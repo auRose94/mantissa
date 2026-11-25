@@ -33,11 +33,11 @@ module mantissa_fpu
   input  logic [2:0]   fmt2,
   input  logic [1:0]   sel,
   input  logic [127:0] a,       // a quad travels here in full; the narrow formats in the low 64
-  input  logic [63:0]  b,
-  input  logic [63:0]  c,
+  input  logic [127:0] b,       // since quad arithmetic, all three operands may be quads
+  input  logic [127:0] c,
   output logic         done,
   output logic [127:0] y,       // a quad result in full; the narrow formats in the low 64
-  output logic [63:0]  y2,
+  output logic [127:0] y2,
   output logic [4:0]   flags
 );
 
@@ -61,6 +61,13 @@ module mantissa_fpu
   import "DPI-C" function void c_q_narrow(input longint unsigned ahi, input longint unsigned alo,
                                           input int dst, output longint unsigned yv,
                                           output int flags);
+  import "DPI-C" function void c_quad_op(input int op, input int f, input int f2,
+                                         input longint unsigned ahi, input longint unsigned alo,
+                                         input longint unsigned bhi, input longint unsigned blo,
+                                         input longint unsigned chi, input longint unsigned clo,
+                                         output longint unsigned yhi, output longint unsigned ylo,
+                                         output longint unsigned y2hi, output longint unsigned y2lo,
+                                         output int flags);
 
   localparam real TWO_53 = 9007199254740992.0;
 
@@ -837,16 +844,16 @@ module mantissa_fpu
   // ---- the operation ----------------------------------------------------------------------
 
   function automatic void compute(input fpu_op_e o, input logic [2:0] f, input logic [2:0] f2,
-                                  input logic [1:0] cells, input logic [127:0] ab, input logic [63:0] bb,
-                                  input logic [63:0] cb, output logic [127:0] yv, output logic [63:0] y2v,
+                                  input logic [1:0] cells, input logic [127:0] ab, input logic [127:0] bb,
+                                  input logic [127:0] cb, output logic [127:0] yv, output logic [127:0] y2v,
                                   output logic [4:0] fl);
     real av, bv, cv, v, v2, tm, te;
     logic [4:0] fl2, qi;
     logic [63:0] word, qn_y;
     longint unsigned qw_hi, qw_lo;
     av = r(ab[63:0]);
-    bv = r(bb);
-    cv = r(cb);
+    bv = r(bb[63:0]);
+    cv = r(cb[63:0]);
     v2 = 0.0;
     fl2 = 5'd0;
     fl = 5'd0;
@@ -932,7 +939,7 @@ module mantissa_fpu
   fmt_e         fmt_r, fmt2_r;
   logic [1:0]   sel_r;
   logic [127:0] a_r;
-  logic [63:0]  b_r, c_r;
+  logic [127:0] b_r, c_r;
 
   always_ff @(posedge clk) begin
     if (!rst_n) begin
@@ -942,8 +949,8 @@ module mantissa_fpu
       fmt2_r <= fmt_D;
       sel_r <= 2'd0;
       a_r   <= 128'd0;
-      b_r   <= 64'd0;
-      c_r   <= 64'd0;
+      b_r   <= 128'd0;
+      c_r   <= 128'd0;
     end else begin
       done <= start;
       if (start) begin
@@ -975,11 +982,19 @@ module mantissa_fpu
       y = a_r;
       y2 = 64'd0;
       flags = 5'd0;
-    end else if ((fmt_r == FMT_Q || (fmt2_r == FMT_Q && op_r == F_MANT)) && op_r != F_CVT) begin
-      // no quad arithmetic yet
-      y = (fmt_r == FMT_Q) ? mantissa_pkg::QNAN_BITS : {64'd0, NAN_BITS};
-      y2 = 64'd0;
-      flags = 5'd0;
+    end else if ((fmt_r == FMT_Q && op_r != F_CVT) || (fmt2_r == FMT_Q && op_r inside {F_MANT, F_SPLIT, F_JOIN})) begin
+      // quad arithmetic: the whole operation dispatches to the software
+      // binary128 in c_quad_op -- the same engine the HIP port runs, round
+      // for round.  CVT keeps its exact shuffle above; MOV and the bit
+      // paths keep their identity.
+      longint unsigned qy_hi, qy_lo, qy2_hi, qy2_lo;
+      int qi;
+      c_quad_op(int'(op_r), int'(fmt_r), int'(fmt2_r),
+                a_r[127:64], a_r[63:0], b_r[127:64], b_r[63:0], c_r[127:64], c_r[63:0],
+                qy_hi, qy_lo, qy2_hi, qy2_lo, qi);
+      y = {qy_hi, qy_lo};
+      y2 = {qy2_hi, qy2_lo};
+      flags = qi[4:0];
     end else begin
       compute(op_r, fmt_r, fmt2_r, sel_r, a_r, b_r, c_r, y, y2, flags);
     end
