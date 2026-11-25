@@ -42,6 +42,7 @@ Needs Python 3.10 or newer and nothing else.  From this directory:
     python -m mantissa run programs/pointers.mant
     python -m mantissa run programs/quad.mant
     python3 gpu/python/screen.py programs/plasma.mant --pngs frames   # the machine paints, the console watches
+    python3 gpu/python/screen.py programs/pong.mant --keys            # steer with the arrows or wasd
     python -m mantissa disasm programs/smc_edit.mant
     python programs/mandel_zoom.py
     python -m unittest discover -s tests -t .

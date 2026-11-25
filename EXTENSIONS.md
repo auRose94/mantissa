@@ -52,21 +52,42 @@ What it buys, honestly:
   also where the next iteration's products want to live.  The ordering is
   the whole game; `gpu/python/mandel_vector.py` documents the working one.
 
-## The screen: a framebuffer device
+## The screen: built.  A framebuffer device, and the console that watches it
 
 The machine has no output but PUT.  A screen is a memory convention plus a
-console that watches it:
+console that watches it, and both exist now:
 
-    cells [FB, FB + W*H)   one packed colour per pixel (r*65536 + g*256 + b),
-                           row major, top left first
+    doubles [FB, FB + W*H)   one pixel per double, row major, top left first,
+                             the colour packed as r*65536 + g*256 + b -- exact
+                             in a double, just under the float wall
 
-- **Cosim mode** (one machine): the console maps those cells to a window and
-  refreshes when they change.  The game's ffmpeg pipe is this, minus the
-  picks -- the machine writes straight to the watched region.
-- **Array mode** (one machine per pixel): there is no shared memory to watch;
-  the console reads one cell per machine, which is what the game already does.
-  The extension here is batching: a result file that *is* the framebuffer, so
-  the console can blit it without decoding.
+`programs/plasma.mant` paints three moving diagonal stripes into that
+convention, forever, in hand assembly: a base pointer walking the framebuffer,
+two counters, and the packing in three multiplies.  `gpu/python/screen.py` is
+the console: it runs the program in step bursts, reads the cells, and hands
+RGB frames to ffmpeg -- a live window (ffplay), a video (libx264), or PNG
+snapshots.  Nothing interprets: every colour the console reads was computed
+by the machine.  `--steps-per-frame` is the pacing, and it is honest about
+what it is: the machine computes; when to look is the console's business.
+
+Input streams in through the same door, the other way.  A program that
+declares `input: SPACE 32` -- eight doubles of key cells, up down left right
+then spares -- gets its keys written by the console every frame: 1.0 pressed,
+0.0 not.  `--keys` reads the terminal (arrows or wasd, q quits) and feeds
+the cells; the machine reads memory, as it reads everything.
+`programs/pong.mant` is the demonstration: a paddle you steer, a ball that
+bounces off three walls and off the paddle and resets past the bottom, all
+branchless physics -- a bounce is `v' = v + mask * (what the bounce would
+be - v)`, the mask a 1.0 or 0.0 multiply, Mantissa Dodge's trick -- and a
+full repaint every frame.  The tests drive it through the console's own
+`inject_keys`, which is the same path the terminal feeds.
+
+- **Cosim mode** (one machine): what screen.py does today -- the machine
+  writes straight into the watched region, in memory, while the console
+  snapshots it.
+- **Array mode** (one machine per pixel): no shared memory to watch; the
+  console reads one pick per machine.  Mantissa Dodge is this, running --
+  `gpu/python/run_game.py`, a referee machine and 3,072 pixel machines.
 - **3D textures**: memory layout conventions, not hardware.  A volume is
   `base + (z*Y + y)*X + x`; the compiler can know this and emit the address
   arithmetic.  Nothing in the machine changes.
