@@ -162,6 +162,27 @@ is now covered by the fuzzer: the machine has the number of cells the header
 says, not the number the build provides, so a trace recorded with 1,000 cells
 must fault for address 1,000.
 
+## The quad arithmetic dispatch: the window's below-mass sign (WIP, on the branch `fpga-quad-arith`)
+
+The model dispatches quad arithmetic to a software binary128 (`quad_fp.h`,
+the HIP port's engine copied over), and `c_quad_op` answers op by op.  It is
+right for everything except a near-tie family: when a product's exact value
+sits within about half a quantum of the truncation, the window's under-mass
+accounting can carry the wrong sign, and the answer lands one ulp off.
+Repros (from the fpu vectors, seed 4):
+  - MUL 9bbaafbd619699cfe1988ad9f06c144a * f8377019c381e88f38c0c8fd8712b8bc
+    (the engine rounds down; the reference rounds up),
+  - FMA 0000ffff... * 52a6670d... + 0000ffff... (the same family),
+  - ROUND_TO: exact multiples of the step answer one step high (39 cases at
+    the 150k vector count).
+The window placement itself was corrected tonight (each piece's shift used
+W-off-bl, correct only for the piece at the very top of the window; it is now
+W+off-bl), the compare/logb/scalb/split operand orders and sign conventions
+are fixed, and fp.py grew the matching guards.  What remains is the residual
+sign through q_prod_pieces/q_chunks' borrow and the below-mass comparison at
+in-window remainders of 0 and 1 -- the branch's vectors file reproduces all
+of it.
+
 ## The vector instructions
 
 Built: opcodes 72 to 85 (VADD, VSUB, VMUL, VDIV, VFMA, VMIN and VMAX over 2

@@ -548,18 +548,24 @@ def fmax(fmt, a, b):
 
 def lt(fmt, a, b):
     if fmt is Q:
+        if is_qnan(a) or is_qnan(b):
+            return Quad(), 0                 # a comparison with a NaN is false
         return Quad(0, 1 if q_order(a) < q_order(b) else 0), 0
     return (1.0 if a < b else 0.0), 0
 
 
 def le(fmt, a, b):
     if fmt is Q:
+        if is_qnan(a) or is_qnan(b):
+            return Quad(), 0                 # a comparison with a NaN is false
         return Quad(0, 1 if q_order(a) <= q_order(b) else 0), 0
     return (1.0 if a <= b else 0.0), 0
 
 
 def eq(fmt, a, b):
     if fmt is Q:
+        if is_qnan(a) or is_qnan(b):
+            return Quad(), 0                 # a comparison with a NaN is false
         return Quad(0, 1 if q_order(a) == q_order(b) else 0), 0
     return (1.0 if a == b else 0.0), 0
 
@@ -742,6 +748,8 @@ def is_qnan(x):
 
 def q_ratio(x):
     """(num, den), both positive, of a finite Quad's exact value."""
+    if is_qnan(x):
+        raise ValueError("a quad NaN has no ratio")   # callers guard; the op answers the canonical NaN
     if x.e >= 0:
         return x.m << x.e, 1
     return x.m, 1 << -x.e
@@ -795,6 +803,8 @@ def q_infs(a, b):
 
 
 def q_add(a, b):
+    if is_qnan(a) or is_qnan(b):
+        return Q_CANON, 0
     if a.inf and b.inf and a.sign != b.sign:
         return Q_CANON, INVALID
     if a.inf:
@@ -812,6 +822,8 @@ def q_add(a, b):
 
 
 def q_mul(a, b):
+    if is_qnan(a) or is_qnan(b):
+        return Q_CANON, 0
     if a.inf and (b.inf or b.m == 0) or (a.m == 0 and b.inf):
         return Q_CANON, INVALID
     sign = a.sign ^ b.sign
@@ -825,6 +837,8 @@ def q_mul(a, b):
 
 
 def q_div(a, b):
+    if is_qnan(a) or is_qnan(b):
+        return Q_CANON, 0
     if a.inf and b.inf or a.m == 0 and b.m == 0:
         return Q_CANON, INVALID
     sign = a.sign ^ b.sign
@@ -842,6 +856,8 @@ def q_div(a, b):
 
 
 def q_sqrt(a):
+    if is_qnan(a):
+        return Q_CANON, 0
     if a.inf and not a.sign:
         return a, 0
     if a.sign and not (a.m == 0 and a.sign and not a.inf):
@@ -860,6 +876,8 @@ def q_sqrt(a):
 
 
 def q_fma(a, b, c):
+    if is_qnan(a) or is_qnan(b) or is_qnan(c):
+        return Q_CANON, 0
     ab_sign = a.sign ^ b.sign
     if (a.inf and b.m == 0) or (a.m == 0 and b.inf):
         return Q_CANON, INVALID
@@ -881,6 +899,8 @@ def q_fma(a, b, c):
 
 def q_remainder(a, b):
     """The IEEE remainder: always exact, so its flags are always clear."""
+    if is_qnan(a) or is_qnan(b):
+        return Q_CANON, 0
     if a.inf or b.m == 0:
         return Q_CANON, INVALID
     if b.inf or a.m == 0:
@@ -901,6 +921,8 @@ def q_remainder(a, b):
 
 def q_fmod(a, b):
     """MOD: what trunc division leaves over, always exact."""
+    if is_qnan(a) or is_qnan(b):
+        return Q_CANON, 0
     if a.inf or b.m == 0:
         return Q_CANON, INVALID
     if b.inf or a.m == 0:
@@ -953,7 +975,8 @@ def q_compare(a, b):
     if is_qnan(a) or is_qnan(b):
         return Q_CANON, 0
     fa, fb = q_order(a), q_order(b)
-    return Quad(0, (fa > fb) - (fa < fb)), 0
+    diff = (fa > fb) - (fa < fb)
+    return Quad(1 if diff < 0 else 0, abs(diff)), 0   # a sign and a magnitude, never a negative m
 
 
 def q_neg(x):
@@ -1018,7 +1041,16 @@ def q_scaleb(a, n):
         return Q_CANON, 0
     if a.m == 0 or a.inf:
         return a, 0
-    if n == INF:
+    if is_qnan(n):
+        return Q_CANON, 0
+    if isinstance(n, Quad):
+        if n.inf:
+            n = 70000 if not n.sign else -70000
+        elif n.m == 0:
+            n = 0
+        else:
+            n = int(q_fraction(n))               # truncates toward zero, as the spec reads it
+    elif n == INF:
         n = 70000
     elif n == -INF:
         n = -70000
@@ -1041,7 +1073,7 @@ def q_logb(a):
     e = a.e + Q.p - 1
     if a.m < 1 << (Q.p - 1):                # subnormal: counts as the smallest normal
         e = Q.emin
-    return Quad(0, e), 0
+    return Quad(1 if e < 0 else 0, abs(e)), 0   # a sign and a magnitude
 
 
 def q_nextafter(a, b):
@@ -1105,12 +1137,17 @@ def q_split(dst, x):
     if is_qnan(x):
         return Q_CANON, Q_CANON, 0
     if x.inf:
-        return x, x, 0
+        if dst is Q:
+            return x, x, 0
+        value, _ = convert(dst, math.copysign(math.inf, -1.0 if x.sign else 1.0))
+        return value, value, 0
     high, _ = q_convert(dst, x)
     if dst is Q:
         return high, Quad(), 0
     if isinstance(high, (Quad, Qnan)):
         rest = q_fraction(x) - q_fraction(high)
+    elif high == INF or high == -INF:
+        rest = -high                          # a finite x minus an infinite high
     else:
         rest = q_fraction(x) - Fraction(high)
     if rest == 0:
@@ -1120,9 +1157,12 @@ def q_split(dst, x):
         low, _ = convert_into_q(rest)
         exact = q_fraction(low) == rest
     else:
-        low, flags = _round_ratio(dst, *rest.as_integer_ratio())
-        exact = rest.as_integer_ratio()[0] * low.as_integer_ratio()[1] == \
-                low.as_integer_ratio()[0] * rest.as_integer_ratio()[1] and not flags
+        if rest == INF or rest == -INF:
+            low = rest
+            exact = False                       # high + low can never be x again
+        else:
+            low, flags = _round_ratio(dst, *rest.as_integer_ratio())
+            exact = not flags
     return high, low, 0 if exact else INEXACT
 
 
