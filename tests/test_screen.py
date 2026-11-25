@@ -15,6 +15,12 @@ from mantissa.memory import Memory
 
 from gpu.python.screen import Console, decode_colour, image_from_memory, pack_colour
 
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 
 class PackedColours(unittest.TestCase):
     def test_pack_and_decode_round_trip(self):
@@ -34,6 +40,7 @@ class PackedColours(unittest.TestCase):
 
 
 class WatchingConsole(unittest.TestCase):
+    @unittest.skipUnless(HAS_PIL, "PIL is not installed")
     def test_image_from_memory_reads_the_convention(self):
         memory = Memory(4096)
         fb = 1024
@@ -50,6 +57,7 @@ class WatchingConsole(unittest.TestCase):
         self.assertEqual(image.getpixel((0, 1)), (0, 0, 255))
         self.assertEqual(image.getpixel((1, 1)), (9, 8, 7))
 
+    @unittest.skipUnless(HAS_PIL, "PIL is not installed")
     def test_the_painter_observed_through_the_console(self):
         here = Path(__file__).resolve().parents[1]
         console = Console(here / "programs" / "plasma.mant", width=64, height=48)
@@ -62,6 +70,7 @@ class WatchingConsole(unittest.TestCase):
         # the far corner has not been painted at 10,000 steps: still zeroed memory
         self.assertEqual(image.getpixel((63, 47)), (0, 0, 0))
 
+    @unittest.skipUnless(HAS_PIL, "PIL is not installed")
     def test_frames_move_the_stripes(self):
         here = Path(__file__).resolve().parents[1]
         console = Console(here / "programs" / "plasma.mant", width=64, height=48)
