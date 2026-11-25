@@ -6,7 +6,7 @@
             SPACE  16             ; cells held in reserve, all zero
 
 A literal is rounded to its register's format the way C rounds one.  The
-suffix on an instruction (.H, .F or .D) is optional, because every register
+suffix on an instruction (.H, .F, .D or .Q) is optional, because every register
 already says what type it holds; if you write one, every register must match.
 """
 from __future__ import annotations
@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from . import fp
 from .isa import VECTOR_LANES, BY_NAME, WITH_STEP, code_of, encode
 
-FORMAT_BY_SUFFIX = {"H": fp.H, "F": fp.F, "D": fp.D}
-KIND_BY_FILE = {1: "half", 2: "float", 3: "double"}
+FORMAT_BY_SUFFIX = {"H": fp.H, "F": fp.F, "D": fp.D, "Q": fp.Q}
+KIND_BY_FILE = {1: "half", 2: "float", 3: "double", 4: "quad"}
 ALIASES = {"sp": 31, "lr": 30}  # by convention, in float registers: stack pointer and link
 PREDEFINED = {"inf": fp.INF, "nan": fp.NAN}
 
@@ -46,7 +46,7 @@ STEP_FORMS = {"FLOOR": "FLOOR_TO", "CEIL": "CEIL_TO", "CHOP": "CHOP_TO", "ROUND"
 
 _LABEL = re.compile(r"\s*([A-Za-z_]\w*)\s*:")
 _STATEMENT = re.compile(r"([A-Za-z][A-Za-z0-9]*)(?:\.([A-Za-z]+))?\s*(.*)$")
-_REGISTER = re.compile(r"([hfd])(\d{1,2})")
+_REGISTER = re.compile(r"([hfdq])(\d{1,2})")
 _MEMORY = re.compile(r"\[\s*([A-Za-z_]\w*)\s*\]")
 _TOKEN = re.compile(r"[+\-]|[A-Za-z_]\w*|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
 _STRING = re.compile(r'"((?:\\.|[^"\\])*)"$')
@@ -176,6 +176,8 @@ def _unescape(body, lineno):
 
 
 def _register_name(file_number, index):
+    if file_number == 4:
+        return f"q{index}"
     return "hfd"[file_number - 1] + str(index)
 
 
@@ -274,7 +276,7 @@ class _Assembler:
             wanted = " or ".join(str(len(f)) for f in forms)
             raise AsmError(lineno, f"{name} takes {wanted} operands, not {len(operands)}")
         if suffix is not None and suffix not in FORMAT_BY_SUFFIX:
-            raise AsmError(lineno, f"there is no .{suffix}: registers are .H, .F or .D")
+            raise AsmError(lineno, f"there is no .{suffix}: registers are .H, .F, .D or .Q")
         if suffix is not None and "R" not in form and "A" not in form:
             raise AsmError(lineno, f"{name} works on no register, so it takes no suffix")
         parts = [self._operand(kind, item, lineno) for kind, item in zip(form, operands)]
@@ -302,8 +304,13 @@ class _Assembler:
                                            f"{KIND_BY_FILE[file_number]} file only reaches 31")
         self.cells.extend(fp.pack(fp.D, float(encode(spec.number, *fields))))
         for items in expressions:
+            # an inline operand is a double in memory, whatever reads it: a
+            # quad LDI narrows its literal to double and widens at runtime
+            narrow = fp.FORMAT_BY_CODE[files[0]] if spec.name == "LDI" else None
+            if narrow is fp.Q:
+                narrow = fp.D
             self.value(fp.D, items, lineno, "value" if spec.name == "LDI" else "target",
-                       narrow=fp.FORMAT_BY_CODE[files[0]] if spec.name == "LDI" else None)
+                       narrow=narrow)
 
     def _operand(self, kind, text, lineno):
         if kind == "E":
@@ -325,7 +332,12 @@ class _Assembler:
     def _register(text, lineno):
         match = _REGISTER.fullmatch(text.lower())
         if match and int(match[2]) < 32:
-            return "hfd".index(match[1]) + 1, int(match[2])
+            file_number = "hfdq".index(match[1]) + 1
+            index = int(match[2])
+            if file_number == 4 and index > 3:
+                raise AsmError(lineno, f"the machine holds four quad registers, "
+                                       f"and '{text}' is past them")
+            return file_number, index
         if text.lower() in ALIASES:
             return 2, ALIASES[text.lower()]
         raise AsmError(lineno, f"'{text}' is not a register")

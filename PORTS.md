@@ -48,7 +48,8 @@ followed by the lines for what that step changed:
   point, as a decimal number.
 - A step that changed nothing gives one `X` line instead.
 
-A value is always the 64 bits of the double that holds it, as sixteen hex
+A value is always the the bits that hold the value, as hex digits: sixteen for half,
+float and double (the 64 bits of a double), thirty-two for quad (128 bits)
 digits.  A half or a float is widened to a double first.  A NaN that
 arithmetic produced is the quiet NaN `7ff8000000000000`.
 

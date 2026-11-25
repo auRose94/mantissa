@@ -86,6 +86,36 @@ pairs, vtables as float function pointers under the 32 MiB of code.
 The useful rule for all of these: the machine computes, the console watches.
 No instruction ever touches a window.
 
+## Quad: the guard band became a register file
+
+The operand fields are two decimal digits -- a hundred codes -- and three
+files of 32 registers fill 00 to 95.  Codes 96 to 99 were the guard band;
+they are now `q0` to `q3`, four registers of IEEE 754 binary128 (113-bit
+significand, 16 bytes, 8 cells).  Because instructions take their type from
+their registers, every opcode lights up for quad without a new encoding:
+add, mul, sqrt, fma, remainder, min, the casts, nextafter, classify.  The
+reference computes quad exactly -- integer arithmetic end to end, rounded
+once -- which the narrow formats cannot do and quad does not need to fake.
+The counting wall is 2^113: `quad.mant` squares 3,037,000,500 exactly, past
+what any double names.  An inline operand is still a double, so `LDI.Q`
+sees a double literal's true value.
+
+The ports: the fleet's mutation engine refuses quad fields until
+`gpu/src/machine.h` can run them (its reference evaluator would disagree
+with the ISA otherwise); `gpu/test.sh` and `fpga/test.sh` skip
+`golden/quad.trace` with a message, by the same pattern simd used.  The
+GPU has no native float128 -- the plan there is software binary128 over
+three doubles, ~159 internal bits rounded once to 113, because two doubles
+carry ~106 and that is 7 bits short of honest.  The FPGA's format code is
+two bits with no spare slot, so quad there starts with widening.
+
+Octuple is real: IEEE 754 has specified binary256 as an interchange format
+since 2008 (236-bit significand, 19-bit exponent, about 71 decimal digits),
+with no required arithmetic -- a machine that implements it defines what
+implementing means.  It has no room in the two-digit fields, so octuple is
+ISA v3: twelve-digit instructions (`ooo aaa bbb ccc`, still exact in a
+double), fields carrying up to 999 codes.
+
 ## Optimisation patterns, found and measured
 
 Patterns that make Mantissa-1 programs faster, with where they came from:

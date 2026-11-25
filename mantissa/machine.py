@@ -12,9 +12,10 @@ RUNNING, HALTED, FAULT = "running", "halted", "fault"
 ILLEGAL = "illegal-instruction"
 NOT_A_CHARACTER = "not-a-character"
 MAX_CODE_POINT = 0x10FFFF
-HALF, FLOAT, DOUBLE = 1, 2, 3  # register files, as numbered in operand fields
+HALF, FLOAT, DOUBLE, QUAD = 1, 2, 3, 4  # register files, as numbered in operand fields
 
 _ZERO = (0.0,) * 32
+_QZERO = (fp.Quad(),) * 4   # four quad registers, q0 to q3
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,7 @@ class Cpu:
     flags: int = 0
     status: str = RUNNING
     fault: Fault | None = None
+    q: tuple = _QZERO
 
 
 def _file(cpu, number):
@@ -33,6 +35,8 @@ def _file(cpu, number):
         return cpu.h
     if number == FLOAT:
         return cpu.f
+    if number == QUAD:
+        return cpu.q
     return cpu.d
 
 
@@ -46,11 +50,12 @@ def _write(cpu, code, value, pc, flags):
     regs = _file(cpu, number)
     regs = regs[:index] + (value,) + regs[index + 1:]
     return Cpu(regs if number == HALF else cpu.h, regs if number == FLOAT else cpu.f,
-               regs if number == DOUBLE else cpu.d, pc, flags, RUNNING, None)
+               regs if number == DOUBLE else cpu.d, pc, flags, RUNNING, None,
+               regs if number == QUAD else cpu.q)
 
 
 def _with_pc(cpu, pc):
-    return Cpu(cpu.h, cpu.f, cpu.d, pc, cpu.flags, RUNNING, None)
+    return Cpu(cpu.h, cpu.f, cpu.d, pc, cpu.flags, RUNNING, None, cpu.q)
 
 
 def _format(code):
@@ -211,6 +216,8 @@ def _execute(cpu, mem, out):
 
 
 def _putc(value, out):
+    if isinstance(value, (fp.Quad, fp.Qnan)):
+        value = float(fp.q_fraction(value)) if not fp.is_qnan(value) else float("nan")
     if not value.is_integer() or not 0 <= value <= MAX_CODE_POINT \
             or 0xD800 <= value <= 0xDFFF:
         raise Fault(NOT_A_CHARACTER, f"{value!r} is not a Unicode code point")
@@ -224,7 +231,10 @@ def console(write):
     the same number, and PUTC prints its character.  How a value is spelled
     is the console's business; the machine only hands the value over."""
     def out(item):
-        write(f"{item!r}\n" if isinstance(item, float) else item)
+        if isinstance(item, (fp.Quad, fp.Qnan)):
+            write(fp.spell(item) + "\n")
+        else:
+            write(f"{item!r}\n" if isinstance(item, float) else item)
     return out
 
 
@@ -232,7 +242,7 @@ def _system(cpu, mem, pc, op, a, b, flags):
     if op == OP["NOP"]:
         return _with_pc(cpu, pc + 4)
     if op == OP["HALT"]:
-        return Cpu(cpu.h, cpu.f, cpu.d, pc, flags, HALTED, None)
+        return Cpu(cpu.h, cpu.f, cpu.d, pc, flags, HALTED, None, cpu.q)
     if op == OP["JMP"]:
         _need(file_of(a) == FLOAT, "JMP reads its target from a float register")
         target = _read(cpu, a)

@@ -31,13 +31,18 @@ from __future__ import annotations
 import math
 import struct
 
+from . import fp
 from .machine import FAULT, HALTED, RUNNING, step
 
-FILES = ("h", "f", "d")  # registers are listed file by file, in this order
+FILES = ("h", "f", "d", "q")  # registers are listed file by file, in this order
 
 
 def bits(value):
-    """The 64 bits of the double holding `value`, as sixteen hex digits."""
+    """The bits holding `value`, as hex digits: sixteen for the formats a
+    double carries, thirty-two for quad."""
+    from . import fp
+    if isinstance(value, (fp.Quad, fp.Qnan)):
+        return fp.to_bits(fp.Q, value).to_bytes(16, "little").hex()
     return struct.pack("<d", value).hex()
 
 
@@ -57,6 +62,8 @@ class TracedMemory:
 
 
 def _same(a, b):
+    if isinstance(a, (fp.Quad, fp.Qnan)) or isinstance(b, (fp.Quad, fp.Qnan)):
+        return a == b          # quads carry their own sign; dataclass equality is it
     return a is b or (a == b and math.copysign(1.0, a) == math.copysign(1.0, b))
 
 

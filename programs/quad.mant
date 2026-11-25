@@ -1,0 +1,35 @@
+; quad.mant -- binary128: the guard band became a register file.
+;
+; The instruction's operand fields are two decimal digits, so three files of
+; 32 registers fill 00 to 95 -- and 96 to 99 are left over.  The machine made
+; them q0 to q3: four registers of IEEE 754 binary128, sixteen bytes, eight
+; cells, a 113-bit significand that counts whole numbers to 2^113 (about
+; 10^34).  Every instruction already takes its type from its registers, so
+; the whole instruction set lights up for quad with no new opcodes at all.
+;
+; Two rules to know:
+;   - an inline operand is a double, so LDI.Q carries a double widened at
+;     runtime -- a quad sees a double literal's true value;
+;   - the counting walls are quad's own: 2^113, far past float's 2^24.
+        LDI.Q  q0, 2.0
+        LDI.Q  q1, 3.0
+        MUL.Q  q2, q0, q1
+        PUT.Q  q2               ; 6
+
+        LDI.D  d0, 0.1
+        CVT.Q  q3, d0           ; widening a double is exact: quad sees what
+        PUT.Q  q3               ; the double really holds -- all 17 digits
+
+        LDI.H  h0, 4660
+        CVT.Q  q0, h0
+        ADD.Q  q1, q0, q2
+        PUT.Q  q1               ; 4666: half, float and quad in one sum
+
+        LDI.Q  q2, 16777216     ; the float counting wall itself
+        ADD.Q  q3, q2, q0
+        PUT.Q  q3               ; 16781876: a quad counter walks through it
+
+        LDI.Q  q0, 3037000500
+        MUL.Q  q1, q0, q0
+        PUT.Q  q1               ; 9223372037000250000: 2^63-ish, squared exactly,
+        HALT                    ; past what any double names

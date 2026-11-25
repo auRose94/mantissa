@@ -39,6 +39,8 @@ Needs Python 3.10 or newer and nothing else.  From this directory:
     python -m mantissa run programs/smc_emit.mant
     python -m mantissa run programs/bignum.mant
     python -m mantissa run programs/pairs.mant
+    python -m mantissa run programs/pointers.mant
+    python -m mantissa run programs/quad.mant
     python -m mantissa disasm programs/smc_edit.mant
     python programs/mandel_zoom.py
     python -m unittest discover -s tests -t .
@@ -66,14 +68,24 @@ run for another implementation to replay.
 | `.H` half | 16 | 11 | −14 to 15 | 1 | 2,048 |
 | `.F` float | 32 | 24 | −126 to 127 | 2 | 16,777,216 |
 | `.D` double | 64 | 53 | −1022 to 1023 | 4 | 9,007,199,254,740,992 |
+| `.Q` quad | 128 | 113 | −16382 to 16383 | 8 | 2^113, about 10^34 |
 
 **Memory** is a row of 16-bit cells and nothing smaller.  A half is one cell,
 a float two, a double four, most significant cell first.  Data must sit at a
 multiple of its own width.
 
-**Registers**: `h0`–`h31`, `f0`–`f31`, `d0`–`d31`, each holding only its own
-type.  By convention `sp` is `f31` (the runner starts it at the top of
-memory) and `lr` is `f30`.
+**Registers**: `h0`–`h31`, `f0`–`f31`, `d0`–`d31`, and `q0`–`q3`, each holding
+only its own type.  By convention `sp` is `f31` (the runner starts it at the
+top of memory) and `lr` is `f30`.
+
+The quad file is what the encoding had left over.  An operand field is two
+decimal digits -- a hundred codes -- and three files of 32 registers fill
+00 to 95.  The guard band became four registers of IEEE 754 binary128, and
+because every instruction takes its type from its registers, the whole
+instruction set works on quad with no new opcodes: `MUL.Q q2, q0, q1` is
+just `MUL`.  An inline operand is still a double in memory, so `LDI.Q`
+carries a double widened at runtime -- a quad sees a double literal's true
+value.  (`programs/quad.mant`)
 
 **Addresses** are numbers naming cells. `LD` and `ST` read them from any
 register, and the register's format is how far the pointer reaches -- the

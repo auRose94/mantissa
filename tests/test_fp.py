@@ -11,10 +11,12 @@ from fractions import Fraction
 
 from mantissa import fp
 from mantissa.fp import (
-    D, DIVZERO, F, FORMATS, H, INF, INEXACT, INVALID, NAN, NINF, NNORMAL, NSUBNORMAL, NZERO,
+    D, DIVZERO, F, H, INF, INEXACT, INVALID, NAN, NINF, NNORMAL, NSUBNORMAL, NZERO,
     OVERFLOW, PINF, PNORMAL, PSUBNORMAL, PZERO, QNAN, UNDERFLOW,
 )
 from . import support
+
+FORMATS = (H, F, D)  # the formats a double holds exactly; quad runs its own class
 
 MAX_FINITE = {H: 65504.0, F: 3.4028234663852886e+38, D: 1.7976931348623157e+308}
 LAST_ULP = {H: 32.0, F: 2.0 ** 104, D: 2.0 ** 971}
@@ -597,3 +599,66 @@ class GridsAndCasts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuadPrecision(unittest.TestCase):
+    """binary128: values are Quad numbers, arithmetic is exact and rounded
+    once, and the format a double can never hold is still held honestly."""
+
+    def test_a_number_no_double_can_hold(self):
+        x = fp.Quad(0, 10 ** 34)
+        self.assertEqual(fp.q_fraction(x), 10 ** 34)
+        self.assertEqual(fp.to_bits(fp.Q, x) >> 112, 16383 + 112)  # 10^34 sits in binade 2^112
+        back = fp.from_bits(fp.Q, fp.to_bits(fp.Q, x))
+        self.assertEqual(back, x)
+
+    def test_arithmetic_is_exact_then_rounded_once(self):
+        v, flags = fp.mul(fp.Q, fp.Quad(0, 6), fp.Quad(0, 1, -1))
+        self.assertEqual((fp.q_fraction(v), flags), (Fraction(3), 0))
+        v, flags = fp.div(fp.Q, fp.Quad(0, 1), fp.Quad(0, 3))
+        self.assertEqual(flags, fp.INEXACT)               # 1/3 is not a dyadic rational
+        self.assertTrue(0.333333333333333 < float(fp.q_fraction(v)) < 0.3333333333333334)
+
+    def test_signed_zeros_follow_ieee(self):
+        z, _ = fp.add(fp.Q, fp.Quad(1), fp.Quad(1))
+        self.assertEqual(z, fp.Quad(1))                   # -0 + -0 is -0
+        z, _ = fp.add(fp.Q, fp.Quad(0), fp.Quad(1))
+        self.assertEqual(z, fp.Quad(0))                   # +0 + -0 is +0
+        z, _ = fp.mul(fp.Q, fp.Quad(0, 5), fp.Quad(1))
+        self.assertEqual(z, fp.Quad(1))                   # (+5) * (-0) is -0, the sign is xor
+        self.assertEqual(fp.fmin(fp.Q, fp.Quad(0), fp.Quad(1))[0], fp.Quad(1))
+        self.assertEqual(fp.fmax(fp.Q, fp.Quad(0), fp.Quad(1))[0], fp.Quad(0))
+
+    def test_overflow_underflow_and_subnormals(self):
+        v, flags = fp.mul(fp.Q, fp.Quad(0, (1 << 113) - 1, 16384), fp.Quad(0, 1 << 113, 0))
+        self.assertTrue(v.inf)
+        self.assertEqual(fp.flag_names(flags), ["overflow", "inexact"])
+        v, flags = fp.mul(fp.Q, fp.Quad(0, 1, -16494), fp.Quad(0, 1))   # exact subnormal
+        self.assertEqual(v, fp.Quad(0, 1, -16494))
+        self.assertEqual(flags, 0)
+
+    def test_sqrt_division_and_remainder(self):
+        v, flags = fp.sqrt(fp.Q, fp.Quad(0, 4))
+        self.assertEqual((fp.q_fraction(v), flags), (Fraction(2), 0))
+        v, flags = fp.sqrt(fp.Q, fp.Quad(0, 2))
+        self.assertEqual(flags, fp.INEXACT)
+        v, flags = fp.remainder(fp.Q, fp.Quad(0, 7), fp.Quad(0, 3))
+        self.assertEqual((fp.q_fraction(v), flags), (Fraction(1), 0))
+        v, flags = fp.div(fp.Q, fp.Quad(0, 1), fp.Quad(0))
+        self.assertTrue(v.inf)
+        self.assertEqual(fp.flag_names(flags), ["divzero"])
+
+    def test_conversion_widens_doubles_exactly(self):
+        v, flags = fp.convert(fp.Q, 0.1)
+        self.assertEqual(flags, 0)
+        self.assertEqual(fp.q_fraction(v), Fraction(0.1))
+        v, flags = fp.convert(fp.D, fp.Quad(0, 3, -1075))  # 1.5 double ulps: ties to even, up to 2
+        self.assertEqual(flags, fp.UNDERFLOW | fp.INEXACT)
+        self.assertEqual(v, 2.0 ** -1073)
+
+    def test_the_counting_wall_is_2_to_the_113(self):
+        wall = fp.Quad(0, 1, 113)
+        step, flags = fp.add(fp.Q, wall, fp.Quad(0, 1))
+        self.assertEqual(fp.q_fraction(step), 2 ** 113)    # the spacing is 2 here, as the wall demands
+        below = fp.sub(fp.Q, wall, fp.Quad(0, 1))[0]
+        self.assertEqual(fp.q_fraction(below), 2 ** 113 - 1)  # exact below the wall, in a double never

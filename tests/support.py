@@ -10,7 +10,9 @@ import struct
 from fractions import Fraction
 
 from mantissa import asm
-from mantissa.fp import D, F, FORMATS, H, INEXACT, OVERFLOW, UNDERFLOW
+from mantissa.fp import D, F, H, INEXACT, OVERFLOW, UNDERFLOW
+
+FORMATS = (H, F, D)  # the float trio; quad runs its own exact path
 from mantissa.machine import Cpu, console, run
 from mantissa.memory import Memory
 

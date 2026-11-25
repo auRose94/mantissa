@@ -42,13 +42,21 @@ class Encoding(unittest.TestCase):
             86000000, 99000000,           # no such opcode
             100000000, -20000102,         # not eight digits
             float("nan"), float("inf"),
-            isa.encode(20, 96, 0, 0), isa.encode(20, 0, 99, 0),  # 96 to 99 name no register
             isa.encode(10, 0, 1, 2),      # MOV reads two fields, so the third must be 00
             isa.encode(70, 0, 0, 1),
         ]
         for number in strangers:
             with self.subTest(number=number):
                 self.assertIsNone(decoded(number))
+
+    def test_the_guard_band_is_the_quad_file(self):
+        # codes 96 to 99 were spare while the operand fields were two digits
+        # wide; they are q0 to q3 now, and two digits cannot name anything
+        # past them -- the wall that blocked a bigger file enforces this one
+        self.assertEqual(decoded(isa.encode(20, 96, 99, 0)), (20, 96, 99, 0))
+        self.assertEqual(isa.name_of(96), "q0")
+        self.assertEqual(isa.name_of(99), "q3")
+        self.assertEqual(isa.file_of(97), 4)
 
     def test_arithmetic_moves_the_operand_digits(self):
         add = isa.encode(20, 0, 1, 2)  # ADD h0, h1, h2

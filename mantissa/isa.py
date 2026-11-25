@@ -9,7 +9,9 @@ An operand field names a register:
 
     00 to 31  h0 to h31      32 to 63  f0 to f31      64 to 95  d0 to d31
 
-96 to 99 name nothing, and a field an instruction does not use must be 00.
+96 to 99 are q0 to q3, the quad file: binary128, eight cells a register.
+The guard band the two-digit fields left became a file exactly four wide,
+and a field an instruction does not use must still be 00.
 
 Because an instruction is just a number, a program can read one, do
 arithmetic on it and write it back.  Doubles hold these numbers exactly, so
@@ -97,7 +99,8 @@ def group_fits(name, code):
 
 
 def code_of(file_number, index):
-    """The operand field for register `index` of file `file_number` (1 half, 2 float, 3 double)."""
+    """The operand field for register `index` of file `file_number` (1 half,
+    2 float, 3 double, 4 quad -- four registers only)."""
     return (file_number - 1) * 32 + index
 
 
@@ -106,6 +109,8 @@ def file_of(code):
 
 
 def name_of(code):
+    if code >= 96:
+        return f"q{code - 96}"        # the guard band became the quad file
     return "hfd"[code // 32] + str(code % 32)
 
 
@@ -126,8 +131,8 @@ def decode(value):
         return None
     for position, code in zip("abc", (a, b, c)):
         if position in spec.used:
-            if code >= D_BASE + 32:
-                return None
+            if code >= D_BASE + 36:
+                return None     # 96 to 99 name q0 to q3; two digits reach no further
         elif code:
             return None  # an unused field must be 00
     return op, a, b, c
