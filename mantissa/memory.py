@@ -32,7 +32,8 @@ class Memory:
                 # a quad address names a cell exactly when its value is a whole
                 # number: a double address stops at the float wall, a quad
                 # address does not have to
-                addr = exact if exact.denominator == 1 else float(exact)
+                # a whole Fraction stays an int: Fraction.is_integer needs 3.12
+                addr = int(exact) if exact.denominator == 1 else float(exact)
         elif isinstance(addr, fp.Qnan):
             addr = math.nan
         else:
@@ -43,7 +44,7 @@ class Memory:
             reason = "negative address"
         elif addr + width > self.size:
             reason = "past the end of memory"
-        elif not addr.is_integer():
+        elif int(addr) != addr:   # works for int, float and Fraction alike
             reason = "not a whole number of cells"
         elif aligned and addr % width:
             reason = f"misaligned, needs a multiple of {width}"
