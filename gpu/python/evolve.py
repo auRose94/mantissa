@@ -114,10 +114,9 @@ def edit(word, delta):
     not happen in a float: 20010203 is past the wall at 2^24, where a float
     counts by twos and this number rounds to 20010204 before anything is
     added.  A double counts by ones to 2^53, so float(int) is exact for every
-    eight-digit instruction.  None means an opcode off the table, a field
-    naming a register the fleet's machine cannot run, a field the instruction
-    does not use, or an op that would move the layout (LDI, the branches);
-    the caller keeps the word or tries another delta."""
+    eight-digit instruction.  None means an opcode off the table, a field the
+    instruction does not use, or an op that would move the layout (LDI, the
+    branches); the caller keeps the word or tries another delta."""
     m = int(word) + delta
     if not 0 <= m < isa.LIMIT:
         return None
@@ -125,9 +124,6 @@ def edit(word, delta):
     ins = isa.decode(w)
     if ins is None or isa.BY_NUMBER[ins[0]].cells != 4:
         return None
-    for code in ins[1:]:
-        if code >= 96:
-            return None     # q0..q3 are legal ISA, but gpu/src/machine.h has no quad yet
     return w
 
 

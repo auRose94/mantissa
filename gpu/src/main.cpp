@@ -198,7 +198,7 @@ int cosim(int argc, char** argv) {
             if (line.compare(0, 2, "S ") == 0) steps++;
         }
     }
-    uint64_t capacity = 5 * steps + 16;  // a step writes at most S and two registers (quads: two R events)
+    uint64_t capacity = 20 * steps + 64;  // a step writes at most S and two registers (quads: two R events)
     const size_t event_bytes = (size_t)capacity * sizeof(m1::Event);
     const size_t max_bytes = (size_t)6 << 30;
     if (event_bytes > max_bytes) {

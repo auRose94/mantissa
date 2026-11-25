@@ -35,7 +35,7 @@ class TestMutationArithmetic(unittest.TestCase):
     def test_edit_refuses_the_illegal(self):
         self.assertIsNone(evolve.edit(20010203.0, -20000000))   # negative is not a number
         self.assertIsNone(evolve.edit(85999999.0, 1000000))     # opcode 86 is off the table
-        self.assertIsNone(evolve.edit(20109500.0, 100))         # field b walked into 96..99
+        self.assertIsNone(evolve.edit(word(11), 100))           # LDI would grow the layout
         self.assertIsNone(evolve.edit(word(70), 100))           # PUT's unused field must stay 00
         self.assertIsNone(evolve.edit(word(10), 1000000))       # landing on LDI would move the layout
         self.assertIsNone(evolve.edit(word(2), 100))            # so would HALT growing a field

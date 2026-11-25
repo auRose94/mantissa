@@ -357,7 +357,7 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         case FLOOR_TO: case CEIL_TO: case CHOP_TO: case ROUND_TO: case SCALB: case NEXT:
         case LT: case LE: case EQ: case CMP: {
             if (qmode) {
-                uint32_t bh = q_hi(c, b), bl_ = q_lo(c, b), dh = q_hi(c, d), dl = q_lo(c, d);
+                uint64_t bh = q_hi(c, b), bl_ = q_lo(c, b), dh = q_hi(c, d), dl = q_lo(c, d);
                 QRes r;
                 switch (op) {
                     case ADD: r = q_add_bits(bh, bl_, dh, dl); break;
@@ -418,7 +418,7 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         // One register of one type.
         case SQRT: case NEG: case ABS: case LOGB: case FLOOR: case CEIL: case CHOP: case ROUND: case CLASS: {
             if (qmode) {
-                uint32_t bh = q_hi(c, b), bl_ = q_lo(c, b);
+                uint64_t bh = q_hi(c, b), bl_ = q_lo(c, b);
                 QRes r;
                 switch (op) {
                     case SQRT: r = q_sqrt_bits(bh, bl_); break;
@@ -526,6 +526,16 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
 
         case LD: {  // the address may come from any file: a pointer's type is its reach
             uint32_t index;
+            if (qmode) {  // eight cells, most significant cell first, into the register pair
+                if (!address(double_of(R[b]), 8, true, c.size, index)) return fail(c, FAULT_ADDRESS);
+                uint64_t hi, lo;
+                load_quad(c.mem, index, hi, lo);
+                q_set(c, a_, hi, lo);
+                uint32_t tag = fresh();
+                c.tags[2 * (a_ - QUAD_BASE) + 96] = tag;
+                c.tags[2 * (a_ - QUAD_BASE) + 97] = tag;
+                M1_GO(next);
+            }
             uint32_t width = (uint32_t)FORMATS[fa].cells;
             if (!address(double_of(R[b]), width, true, c.size, index)) return fail(c, FAULT_ADDRESS);
             wr(a, from_bits(fa, load_value(fa, c.mem, index)), fresh());
@@ -536,6 +546,17 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
             uint32_t index;
             uint32_t width = (uint32_t)FORMATS[file_of(b)].cells;
             if (!address(double_of(R[a]), width, true, c.size, index)) return fail(c, FAULT_ADDRESS);
+            if (width == 8) {  // ST.Q: the register pair spills as eight cells
+                store_quad(c.mem, index, q_hi(c, b), q_lo(c, b));
+                fx.stored = true;
+                fx.address = index;
+                fx.cells = 8;
+                // for a quad, stored_value carries the hi word and
+                // stored_value_hi the lo: the store printer prints d2 first
+                fx.stored_value = q_hi(c, b);
+                fx.stored_value_hi = q_lo(c, b);
+                M1_GO(next);
+            }
             store_value(file_of(b), c.mem, index, to_bits(file_of(b), double_of(R[b])));
             fx.stored = true;
             fx.address = index;
@@ -629,6 +650,7 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         case PUT:
             fx.printed = qmode ? 3 : 1;
             fx.value = qmode ? q_lo(c, a_) : R[a];
+            fx.value_hi = qmode ? q_hi(c, a_) : 0;
             M1_GO(next);
 
         case PUTC: {
@@ -792,10 +814,18 @@ M1_HD void run(Ctx& c, uint64_t max_steps, Sink* sink, uint64_t* before, uint32_
             emit(*sink, E_STEP, (uint32_t)steps, pc, 0, 0);
             bool anything = false;
             for (uint32_t i = 0; i < NREG; i++) {  // file by file, by register number
-                if (i >= QUAD_BASE && (i - QUAD_BASE) % 2 == 1) continue;  // quad hi words are emitted with the lo
                 if (i >= QUAD_BASE) {
-                    emit(*sink, E_REG, (uint32_t)steps, pc, i, c.regs[i], c.regs[i + 1]);
-                    anything = true;
+                    // a quad register is two words; it changed when either did,
+                    // and the lo word is emitted with the hi it belongs to
+                    if ((i - QUAD_BASE) % 2 == 1) continue;
+                    bool moved = changed(before[i], before_tags[i], c.regs[i], c.tags[i])
+                              || changed(before[i + 1], before_tags[i + 1], c.regs[i + 1], c.tags[i + 1]);
+                    if (moved) {
+                        // the event carries the operand code, not the word index
+                        emit(*sink, E_REG, (uint32_t)steps, pc, QUAD_BASE + (i - QUAD_BASE) / 2,
+                             c.regs[i], c.regs[i + 1]);
+                        anything = true;
+                    }
                     continue;
                 }
                 if (changed(before[i], before_tags[i], c.regs[i], c.tags[i])) {
@@ -805,11 +835,14 @@ M1_HD void run(Ctx& c, uint64_t max_steps, Sink* sink, uint64_t* before, uint32_
             }
 
             if (fx.stored) {
-                emit(*sink, E_STORE, (uint32_t)steps, pc, fx.address << 8 | fx.cells, fx.stored_value,
-                     fx.stored_value_hi);
+                emit(*sink, E_STORE, (uint32_t)steps, pc, fx.address << 8 | fx.cells,
+                     fx.stored_value, fx.stored_value_hi);
                 anything = true;
             }
-            if (fx.printed == 1) {
+            if (fx.printed == 3) {
+                emit(*sink, E_PUT, (uint32_t)steps, pc, 3, fx.value_hi, fx.value);  // hi, lo: the printer prints d2 first
+                anything = true;
+            } else if (fx.printed == 1) {
                 emit(*sink, E_PUT, (uint32_t)steps, pc, 0, fx.value, fx.value_hi);
                 anything = true;
             } else if (fx.printed == 2) {
