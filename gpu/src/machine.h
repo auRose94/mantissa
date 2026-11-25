@@ -90,7 +90,8 @@ M1_HD inline uint32_t lanes_of(uint32_t op) {
             || op == VMIN2 || op == VMAX2) ? 2 : 4;
 }
 
-constexpr uint32_t NREG = 96;  // h0-h31 are 0-31, f0-f31 are 32-63, d0-d31 are 64-95
+constexpr uint32_t NREG = 104;  // h/f/d: 0-95, q0-q3: 96-103 (two words per quad)
+constexpr uint32_t QUAD_BASE = 96;  // the operand fields 96-99
 
 constexpr uint64_t bit(uint32_t n) { return (uint64_t)1 << n; }
 constexpr uint64_t range(uint32_t lo, uint32_t hi) {  // bits lo..hi, inclusive
@@ -128,7 +129,7 @@ constexpr const char* FAULT_NAMES[4] = {"", "address", "illegal-instruction", "n
 
 // One machine.  `regs` and `mem` may live in shared memory or in global memory.
 struct Ctx {
-    uint64_t* regs;   // the 96 registers, as the bits of their doubles
+    uint64_t* regs;   // the 104 registers: 96 as double bits, 8 as quad hi:lo pairs
     uint32_t* tags;   // which NaN object a register holds; only the trace can tell them apart
     uint8_t* mem;     // the cells, two bytes each, most significant cell of a value first
     uint32_t size;    // how many cells
@@ -144,9 +145,11 @@ struct Ctx {
 struct Effects {
     bool stored;
     uint32_t address, cells;
-    uint64_t stored_value;  // the bits of the double that was stored, as the reference reports it
+    uint64_t stored_value;       // the low 64 bits
+    uint64_t stored_value_hi;    // the high 64 bits (quads only)
     uint32_t printed;       // 0 nothing, 1 a value (PUT), 2 a character (PUTC)
-    uint64_t value;
+    uint64_t value;       // the low 64 bits
+    uint64_t value_hi;    // the high 64 bits (quads only)
     uint32_t code;
 };
 
@@ -211,10 +214,58 @@ M1_HD inline void store_value(int fmt, uint8_t* mem, uint32_t index, uint64_t va
         __builtin_memcpy(mem + 2 * (size_t)index, &u, 2);
     }
 }
+// a quad's eight cells, most significant cell first, as two 64-bit words
+M1_HD inline void load_quad(uint8_t* mem, uint32_t index, uint64_t& hi, uint64_t& lo) {
+    hi = load64(mem, index);
+    lo = load64(mem, index + 4);
+}
+M1_HD inline void store_quad(uint8_t* mem, uint32_t index, uint64_t hi, uint64_t lo) {
+    store64(mem, index, hi);
+    store64(mem, index + 4, lo);
+}
+M1_HD inline void store_quad_or_double(uint8_t* mem, uint32_t index, int fmt, uint64_t qhi, uint64_t qlo,
+                                       uint64_t bits) {
+    if (fmt == 3) store_quad(mem, index, qhi, qlo);
+    else store_value(fmt, mem, index, bits);
+}
+
+// --- quad register helpers -----------------------------------------------------------
+
+M1_HD inline uint64_t q_hi(const Ctx& c, uint32_t code) { return c.regs[2 * (code - QUAD_BASE) + 96]; }
+M1_HD inline uint64_t q_lo(const Ctx& c, uint32_t code) { return c.regs[2 * (code - QUAD_BASE) + 97]; }
+M1_HD inline void q_set(Ctx& c, uint32_t code, uint64_t hi, uint64_t lo) {
+    c.regs[2 * (code - QUAD_BASE) + 96] = hi;
+    c.regs[2 * (code - QUAD_BASE) + 97] = lo;
+}
+M1_HD inline bool blshift_over(u128 m, unsigned s) {
+    if (m == 0) return false;
+    return (int)bitlen128(m) + (int)s > 127;
+}
+
+// a quad address names a cell exactly when its value is a whole number; a
+// double address stops at the float wall, a quad address does not have to
+M1_HD inline bool quad_address(const Ctx& c, uint32_t code, uint32_t width, uint32_t size, uint32_t& index) {
+    Qdec d = q_decode(q_hi(c, code), q_lo(c, code));
+    if (d.kind == 3) return false;                        // NaN
+    if (d.kind == 2) return false;                        // infinity
+    if (d.sign && d.m) return false;                      // negative
+    u128 v;
+    if (d.e >= 0) {
+        if (d.e >= 64 || blshift_over(d.m, (unsigned)d.e)) return false;
+        v = d.m << (unsigned)d.e;
+    } else {
+        int t = -d.e;
+        if ((d.m & ((t < 128 ? (((u128)1 << (unsigned)t) - 1) : ~(u128)0))) != 0) return false;  // not whole
+        v = t < 128 ? (d.m >> (unsigned)t) : 0;
+    }
+    if (v > (u128)size) return false;
+    index = (uint32_t)v;
+    return index % width == 0;
+}
 
 // --- decode --------------------------------------------------------------------------
 
-constexpr uint32_t file_of(uint32_t code) { return code >> 5; }  // 0 half, 1 float, 2 double
+constexpr uint32_t file_of(uint32_t code) { return code >> 5; }  // 0 half, 1 float, 2 double, 3 quad
 
 // `word` is the double the machine fetched.  It must be a whole number below 100,000,000 whose
 // opcode exists, whose unused fields are 00 and whose used fields name registers.  For an
@@ -234,14 +285,16 @@ M1_HD inline bool decode(uint64_t word, uint32_t& op, uint32_t& a, uint32_t& b, 
     c = n % 100u;
     uint32_t used = (bitmap(USED_A_LO, USED_A_HI, op) | (bitmap(USED_B_LO, USED_B_HI, op) << 1)
                      | (bitmap(USED_C_LO, USED_C_HI, op) << 2));
-    uint32_t ka = a >> 5, kb = b >> 5, kc = c >> 5;  // 3 names nothing
-    if (!(((used & 1) ? ka < 3 : a == 0) && ((used & 2) ? kb < 3 : b == 0) && ((used & 4) ? kc < 3 : c == 0)))
+    uint32_t ka = a >> 5, kb = b >> 5, kc = c >> 5;  // 3 names q0-q3
+    if (!(((used & 1) ? ka < 4 : a == 0) && ((used & 2) ? kb < 4 : b == 0) && ((used & 4) ? kc < 4 : c == 0)))
         return false;
     spec = used | (uint32_t)(bitmap(SAME_TYPE_LO, SAME_TYPE_HI, op) << 3);
     if (spec & 8) {  // all the used operands must be registers of one type
         uint32_t kinds = ((used & 1) ? bit(ka) : 0) | ((used & 2) ? bit(kb) : 0) | ((used & 4) ? bit(kc) : 0);
         if (kinds & (kinds - 1)) return false;
     }
+    if (op >= VADD2 && op <= VMAX4 && (a >= QUAD_BASE || b >= QUAD_BASE || c >= QUAD_BASE))
+        return false;  // no vector instructions on the quad file
     return true;
 }
 
@@ -256,6 +309,9 @@ M1_HD inline bool operand(Ctx& c, uint32_t pc, uint32_t k, uint64_t& value) {
 // --- one step ------------------------------------------------------------------------
 
 M1_HD inline uint32_t fail(Ctx& c, uint32_t kind) {
+#ifdef M1_TRACE
+    std::printf("FAULT kind %u at pc %u\n", kind, c.pc);
+#endif
     c.status = FAULTED;
     c.fault = kind;
     return FAULTED;
@@ -271,7 +327,10 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
     uint64_t* R = c.regs;
     uint32_t next = pc + 4;
     uint32_t fa = file_of(a);  // the format of the first operand's register
+    uint32_t a_ = a;           // the first operand's code (the quad paths use it)
+    uint32_t b_ = b;           // the second operand's code
     uint64_t target;
+    bool qmode = fa == 3;  // the quad file: every instruction works by type
 
     auto fresh = [&]() -> uint32_t {  // a NaN that comes out of memory is a new object every time
         return ++c.serial;
@@ -297,6 +356,34 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         case ADD: case SUB: case MUL: case DIV: case REM: case MOD: case MIN: case MAX: case CPSGN:
         case FLOOR_TO: case CEIL_TO: case CHOP_TO: case ROUND_TO: case SCALB: case NEXT:
         case LT: case LE: case EQ: case CMP: {
+            if (qmode) {
+                uint32_t bh = q_hi(c, b), bl_ = q_lo(c, b), dh = q_hi(c, d), dl = q_lo(c, d);
+                QRes r;
+                switch (op) {
+                    case ADD: r = q_add_bits(bh, bl_, dh, dl); break;
+                    case SUB: r = q_sub_bits(bh, bl_, dh, dl); break;
+                    case MUL: r = q_mul_bits(bh, bl_, dh, dl); break;
+                    case DIV: r = q_div_bits(bh, bl_, dh, dl); break;
+                    case REM: r = q_rem_bits(bh, bl_, dh, dl, 0); break;
+                    case MOD: r = q_rem_bits(bh, bl_, dh, dl, 1); break;
+                    case MIN: r = q_min_bits(bh, bl_, dh, dl); break;
+                    case MAX: r = q_max_bits(bh, bl_, dh, dl); break;
+                    case CPSGN: r = q_copysign_bits(bh, bl_, dh, dl); break;
+                    case FLOOR_TO: r = q_grid_bits(0, bh, bl_, dh, dl); break;
+                    case CEIL_TO: r = q_grid_bits(1, bh, bl_, dh, dl); break;
+                    case CHOP_TO: r = q_grid_bits(2, bh, bl_, dh, dl); break;
+                    case ROUND_TO: r = q_grid_bits(3, bh, bl_, dh, dl); break;
+                    case SCALB: r = q_scalb_bits(bh, bl_, dh, dl); break;
+                    case NEXT: r = q_next_bits(bh, bl_, dh, dl); break;
+                    case LT: r = q_lt_bits(bh, bl_, dh, dl); break;
+                    case LE: r = q_le_bits(bh, bl_, dh, dl); break;
+                    case EQ: r = q_eq_bits(bh, bl_, dh, dl); break;
+                    default: r = q_cmp_bits(bh, bl_, dh, dl); break;
+                }
+                c.flags |= r.flags;
+                q_set(c, a_, r.hi, r.lo);
+                M1_GO(next);
+            }
             double x = double_of(R[b]), y = double_of(R[d]);
             Result r;
             switch (op) {
@@ -330,6 +417,24 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
 
         // One register of one type.
         case SQRT: case NEG: case ABS: case LOGB: case FLOOR: case CEIL: case CHOP: case ROUND: case CLASS: {
+            if (qmode) {
+                uint32_t bh = q_hi(c, b), bl_ = q_lo(c, b);
+                QRes r;
+                switch (op) {
+                    case SQRT: r = q_sqrt_bits(bh, bl_); break;
+                    case NEG: r = q_neg_bits(bh, bl_); break;
+                    case ABS: r = q_abs_bits(bh, bl_); break;
+                    case LOGB: r = q_logb_bits(bh, bl_); break;
+                    case FLOOR: r = q_integral_bits(0, bh, bl_); break;
+                    case CEIL: r = q_integral_bits(1, bh, bl_); break;
+                    case CHOP: r = q_integral_bits(2, bh, bl_); break;
+                    case ROUND: r = q_integral_bits(3, bh, bl_); break;
+                    default: r = q_class_bits(bh, bl_); break;
+                }
+                c.flags |= r.flags;
+                q_set(c, a_, r.hi, r.lo);
+                M1_GO(next);
+            }
             double x = double_of(R[b]);
             Result r;
             uint32_t tag = 0;  // NEG, ABS and CPSGN copy a NaN as it is, as a new object
@@ -350,6 +455,13 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         }
 
         case FMA: {  // rd = ra * rb + rd, rounded once
+            if (qmode) {
+                QRes r = q_fma_bits(q_hi(c, a_), q_lo(c, a_), q_hi(c, b), q_lo(c, b),
+                                    q_hi(c, d), q_lo(c, d));
+                c.flags |= r.flags;
+                q_set(c, a_, r.hi, r.lo);
+                M1_GO(next);
+            }
             Result r = op_fma(fa, double_of(R[b]), double_of(R[d]), double_of(R[a]));
             c.flags |= r.flags;
             wr(a, r.value, 0);
@@ -392,11 +504,20 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         }
 
         case MOV:  // the same object passes from one register to the other
+            if (qmode) {
+                q_set(c, a_, q_hi(c, b), q_lo(c, b));
+                M1_GO(next);
+            }
             wr(a, double_of(R[b]), TRACE ? c.tags[b] : 0);
             M1_GO(next);
 
         case LDI: {  // the inline operand is rounded once, the way the register it loads into needs
             if (!operand(c, pc, 4, target)) return fail(c, FAULT_ADDRESS);
+            if (qmode) {
+                QRes r = q_from_double(double_of(target));  // every double is exact in quad
+                q_set(c, a_, r.hi, r.lo);
+                M1_GO(pc + 8);
+            }
             Result r = convert(fa, double_of(target));
             c.flags |= r.flags;
             wr(a, r.value, 0);
@@ -425,6 +546,18 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
 
         case CVT: {  // changes type, so its registers must differ in type
             if (fa == file_of(b)) return fail(c, FAULT_ILLEGAL);
+            if (qmode) {  // a double widened into quad: every double is exact there
+                QRes r = q_from_double(double_of(R[b]));
+                c.flags |= r.flags;
+                q_set(c, a_, r.hi, r.lo);
+                M1_GO(next);
+            }
+            if (file_of(b) == 3) {  // a quad narrowed into a smaller format
+                Result r = q_to_fmt(fa, q_hi(c, b), q_lo(c, b));
+                c.flags |= r.flags;
+                wr(a, r.value, 0);
+                M1_GO(next);
+            }
             Result r = convert(fa, double_of(R[b]));
             c.flags |= r.flags;
             wr(a, r.value, 0);
@@ -433,6 +566,20 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
 
         case SPLIT: {  // SPLIT high, low, x: two registers of one type
             if (fa != file_of(b)) return fail(c, FAULT_ILLEGAL);
+            if (qmode) {  // quad into quad: the split is exact, the low half is +0
+                q_set(c, a_, q_hi(c, d), q_lo(c, d));
+                q_set(c, b_, 0, 0);
+                M1_GO(next);
+            }
+            if (file_of(d) == 3) {  // a quad split into a smaller format
+                Result hi = q_to_fmt(fa, q_hi(c, d), q_lo(c, d));
+                uint32_t fl2 = 0;
+                Result lo = q_split_low(fa, q_hi(c, d), q_lo(c, d), hi.value, fl2);
+                wr(a, hi.value, 0);
+                wr(b, lo.value, 0);
+                c.flags |= fl2;
+                M1_GO(next);
+            }
             Pair p = op_split(fa, double_of(R[d]));
             uint32_t tag = TRACE ? c.tags[d] : 0;  // a NaN goes into both halves, as the same object
             wr(a, p.high, tag);
@@ -443,6 +590,12 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
 
         case JOIN: {  // JOIN x, high, low: the two parts are read from registers of one type
             if (file_of(b) != file_of(d)) return fail(c, FAULT_ILLEGAL);
+            if (qmode) {  // quad halves: the exact sum, rounded once
+                QRes r = q_join_bits(3, q_hi(c, b), q_lo(c, b), q_hi(c, d), q_lo(c, d));
+                c.flags |= r.flags;
+                q_set(c, a_, r.hi, r.lo);
+                M1_GO(next);
+            }
             Result r = op_join(fa, double_of(R[b]), double_of(R[d]));
             c.flags |= r.flags;
             wr(a, r.value, 0);
@@ -450,6 +603,20 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         }
 
         case MANT: {  // MANT m, e, x: the two results are each rounded to their own register
+            if (file_of(d) == 3) {  // a quad source: both results are quads
+                QRes mq = q_mant_m_bits(q_hi(c, d), q_lo(c, d));
+                QRes eq = q_mant_e_bits(q_hi(c, d), q_lo(c, d));
+                if (qmode) {
+                    q_set(c, a_, mq.hi, mq.lo);
+                    q_set(c, b_, eq.hi, eq.lo);
+                    M1_GO(next);
+                }
+                Result rm = q_to_fmt(fa, mq.hi, mq.lo), re = q_to_fmt(file_of(b), eq.hi, eq.lo);
+                wr(a, rm.value, 0);
+                wr(b, re.value, 0);
+                c.flags |= rm.flags | re.flags;
+                M1_GO(next);
+            }
             double m, e;
             op_mantissa(double_of(R[d]), m, e);
             Result rm = convert(fa, m), re = convert(file_of(b), e);
@@ -460,12 +627,18 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         }
 
         case PUT:
-            fx.printed = 1;
-            fx.value = R[a];
+            fx.printed = qmode ? 3 : 1;
+            fx.value = qmode ? q_lo(c, a_) : R[a];
             M1_GO(next);
 
         case PUTC: {
-            double value = double_of(R[a]);
+            double value;
+            if (qmode) {
+                Result x = q_to_fmt(2, q_hi(c, a_), q_lo(c, a_));
+                value = x.value;  // fp.py: float(q_fraction(value)), nan for a NaN
+            } else {
+                value = double_of(R[a]);
+            }
             if (!whole_bits(bits_of(value) & ~SIGN64) || sign_bit(value) || value > 1048575.0 ||
                 (value >= 55296.0 && value <= 57343.0))
                 return fail(c, FAULT_CHARACTER);  // not a Unicode code point
@@ -476,7 +649,15 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
 
         case BZ: case BNZ: {  // the target is read before the condition is tested
             if (!operand(c, pc, 4, target)) return fail(c, FAULT_ADDRESS);
-            if ((R[a] << 1) == 0 == (op == BZ)) {  // +0 and -0 are both zero; a NaN is not
+            bool is_zero;
+            if (qmode) {
+                Qdec d = q_decode(q_hi(c, a_), q_lo(c, a_));
+                Qdec zero_d = q_decode(0, 0);
+                is_zero = q_order3(d, zero_d) == 0;  // the FPU compare path
+            } else {
+                is_zero = (R[a] << 1) == 0;  // +0 and -0 are both zero; a NaN is not
+            }
+            if (is_zero == (op == BZ)) {
                 uint32_t index;
                 if (!address(double_of(target), 4, true, c.size, index)) return fail(c, FAULT_ADDRESS);
                 M1_GO(index);
@@ -522,8 +703,19 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         }
 
         default: {  // BEQ, BNE, BLT, BLE; BNE is taken for NaN
-            double x = double_of(R[a]), y = double_of(R[b]);
-            bool taken = op == BEQ ? x == y : op == BNE ? x != y : op == BLT ? x < y : x <= y;
+            bool taken;
+            if (file_of(a) == 3 && file_of(b) == 3) {
+                // the FPU compare path on the quad file
+                Qdec x = q_decode(q_hi(c, a_), q_lo(c, a_)), y = q_decode(q_hi(c, b), q_lo(c, b));
+                bool both_nan = x.kind == 3 && y.kind == 3;
+                int o = (x.kind == 3 || y.kind == 3) ? 2 : q_order3(x, y);
+                bool eq = o == 0, lt = o < 0;
+                taken = op == BEQ ? (eq && !both_nan) : op == BNE ? !eq
+                    : op == BLT ? lt : (lt || eq);
+            } else {
+                double x = double_of(R[a]), y = double_of(R[b]);
+                taken = op == BEQ ? x == y : op == BNE ? x != y : op == BLT ? x < y : x <= y;
+            }
             if (taken) {
                 if (!operand(c, pc, 4, target)) return fail(c, FAULT_ADDRESS);
                 uint32_t index;
@@ -545,7 +737,8 @@ struct Event {
     uint32_t step;
     uint32_t pc;
     uint32_t c;  // a register code; an address in its top 24 bits and a width in its low 8; a character; a fault kind
-    uint64_t d;  // the 64 bits of a value
+    uint64_t d;   // the low 64 bits of a value
+    uint64_t d2;  // the high 64 bits of a quad value (0 for the narrow formats)
 };
 
 struct Sink {
@@ -555,7 +748,7 @@ struct Sink {
     bool overflowed;
 };
 
-M1_HD inline void emit(Sink& sink, uint32_t kind, uint32_t step, uint32_t pc, uint32_t c, uint64_t d) {
+M1_HD inline void emit(Sink& sink, uint32_t kind, uint32_t step, uint32_t pc, uint32_t c, uint64_t d, uint64_t d2 = 0) {
     if (sink.count < sink.capacity) {
         Event& e = sink.out[sink.count++];
         e.kind = kind;
@@ -563,6 +756,7 @@ M1_HD inline void emit(Sink& sink, uint32_t kind, uint32_t step, uint32_t pc, ui
         e.pc = pc;
         e.c = c;
         e.d = d;
+        e.d2 = d2;
     } else {
         sink.overflowed = true;
     }
@@ -588,6 +782,7 @@ M1_HD void run(Ctx& c, uint64_t max_steps, Sink* sink, uint64_t* before, uint32_
                 before[i] = c.regs[i];
                 before_tags[i] = c.tags[i];
             }
+
         }
         Effects fx;
         fx.stored = false;
@@ -597,17 +792,25 @@ M1_HD void run(Ctx& c, uint64_t max_steps, Sink* sink, uint64_t* before, uint32_
             emit(*sink, E_STEP, (uint32_t)steps, pc, 0, 0);
             bool anything = false;
             for (uint32_t i = 0; i < NREG; i++) {  // file by file, by register number
+                if (i >= QUAD_BASE && (i - QUAD_BASE) % 2 == 1) continue;  // quad hi words are emitted with the lo
+                if (i >= QUAD_BASE) {
+                    emit(*sink, E_REG, (uint32_t)steps, pc, i, c.regs[i], c.regs[i + 1]);
+                    anything = true;
+                    continue;
+                }
                 if (changed(before[i], before_tags[i], c.regs[i], c.tags[i])) {
                     emit(*sink, E_REG, (uint32_t)steps, pc, i, c.regs[i]);
                     anything = true;
                 }
             }
+
             if (fx.stored) {
-                emit(*sink, E_STORE, (uint32_t)steps, pc, fx.address << 8 | fx.cells, fx.stored_value);
+                emit(*sink, E_STORE, (uint32_t)steps, pc, fx.address << 8 | fx.cells, fx.stored_value,
+                     fx.stored_value_hi);
                 anything = true;
             }
             if (fx.printed == 1) {
-                emit(*sink, E_PUT, (uint32_t)steps, pc, 0, fx.value);
+                emit(*sink, E_PUT, (uint32_t)steps, pc, 0, fx.value, fx.value_hi);
                 anything = true;
             } else if (fx.printed == 2) {
                 emit(*sink, E_PUTC, (uint32_t)steps, pc, fx.code, 0);
@@ -631,6 +834,7 @@ M1_HD inline void reset(Ctx& c, uint32_t entry, uint32_t sp) {
         c.regs[i] = 0;
         if (c.tags) c.tags[i] = 0;
     }
+
     c.regs[63] = bits_of((double)sp);  // f31
     c.pc = entry;
     c.flags = 0;

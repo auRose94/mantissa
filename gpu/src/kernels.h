@@ -11,14 +11,14 @@
 namespace m1 {
 
 // How the cosim kernel lays out its shared memory, in bytes.
-constexpr uint32_t COSIM_LDS = 96 * 8 + 96 * 4 + 96 * 8 + 96 * 4;  // regs, tags, before, before tags
+constexpr uint32_t COSIM_LDS = 104 * 8 + 104 * 4 + 104 * 8 + 104 * 4;  // regs, tags, before, before tags
 
 // The array kernel keeps each work-item's registers in shared memory.  The
-// per-item stride is 98 eight-byte words rather than 96: with a stride that
-// is 2 modulo 4 in four-byte banks, the sixteen lanes of a wavefront that
-// read the same register hit sixteen different pairs of banks.
-constexpr uint32_t REG_STRIDE = 98 * 8;
-constexpr uint32_t ARRAY_BLOCK = 64;  // two wavefronts: 64 * 784 bytes is under the 64 KiB limit
+// per-item stride is 106 eight-byte words rather than 104 (96 + 8 quad): with
+// a stride that is 2 modulo 4 in four-byte banks, the sixteen lanes of a
+// wavefront that read the same register hit sixteen different pairs of banks.
+constexpr uint32_t REG_STRIDE = 106 * 8;  // 104 words of data + 2 words of bank padding
+constexpr uint32_t ARRAY_BLOCK = 64;  // two wavefronts: 64 * 848 bytes is under the 64 KiB limit
 
 struct ArrayHead {
     uint32_t instances, cells;
@@ -56,12 +56,13 @@ __global__ void cosim_kernel(uint32_t entry, uint32_t cells, uint32_t sp, uint64
     if (threadIdx.x != 0) return;
     Ctx c;
     c.regs = (uint64_t*)lds;
-    c.tags = (uint32_t*)(lds + 96 * 8);
+    c.tags = (uint32_t*)(lds + 104 * 8);
     c.mem = memory;
     c.size = cells;
     reset(c, entry, sp);
     Sink sink{events, capacity, 0, false};
-    run<true>(c, max_steps, &sink, (uint64_t*)(lds + 96 * 12), (uint32_t*)(lds + 96 * 20));
+    run<true>(c, max_steps, &sink, (uint64_t*)(lds + 104 * 8 + 104 * 4),
+              (uint32_t*)(lds + 104 * 8 + 104 * 4 + 104 * 8));
     result[0] = sink.count;
     result[1] = sink.overflowed ? 1 : 0;
     result[2] = c.status;

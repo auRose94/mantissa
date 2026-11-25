@@ -25,6 +25,9 @@
 #include "machine.h"
 
 void* operator new(std::size_t n) { return mantissa_aligned_new(n); }
+void operator delete(void* p) noexcept { free(p); }
+void* operator new[](std::size_t n) { return mantissa_aligned_new(n); }
+void operator delete[](void* p) noexcept { free(p); }
 
 namespace {
 
@@ -195,7 +198,7 @@ int cosim(int argc, char** argv) {
             if (line.compare(0, 2, "S ") == 0) steps++;
         }
     }
-    uint64_t capacity = 3 * steps + 8;  // a step writes at most S and two registers
+    uint64_t capacity = 5 * steps + 16;  // a step writes at most S and two registers (quads: two R events)
     const size_t event_bytes = (size_t)capacity * sizeof(m1::Event);
     const size_t max_bytes = (size_t)6 << 30;
     if (event_bytes > max_bytes) {
@@ -244,24 +247,48 @@ int cosim(int argc, char** argv) {
 
     // The events become the text of the reference's format.
     std::string text;
-    text.reserve(events.size() * 40 + header.size() + 16);
+    text.reserve(events.size() * 56 + header.size() + 16);
     text += header;
     text += "run\n";
     std::vector<std::string> mine;
     mine.reserve(events.size());
-    char line[96];
+    char line[128];
     for (const m1::Event& e : events) {
         switch (e.kind) {
             case m1::E_STEP: std::snprintf(line, sizeof line, "S %u %u", e.step, e.pc); break;
             case m1::E_REG:
-                std::snprintf(line, sizeof line, "R %u %u %c%u %s", e.step, e.pc, "hfd"[e.c >> 5], e.c & 31,
-                              hex64(e.d).c_str());
+                if (e.c >= m1::QUAD_BASE) {
+                    // a quad register: the trace carries the 128-bit value as 32 hex digits
+                    char buf[33];
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 2 * k, 3, "%02x", (unsigned)(e.d2 >> (8 * k)) & 0xFF);
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 16 + 2 * k, 3, "%02x", (unsigned)(e.d >> (8 * k)) & 0xFF);
+                    std::snprintf(line, sizeof line, "R %u %u q%u %s", e.step, e.pc, e.c & 31, buf);
+                } else {
+                    std::snprintf(line, sizeof line, "R %u %u %c%u %s", e.step, e.pc, "hfd"[e.c >> 5], e.c & 31,
+                                  hex64(e.d).c_str());
+                }
                 break;
             case m1::E_STORE:
-                std::snprintf(line, sizeof line, "M %u %u %u %u %s", e.step, e.pc, e.c >> 8, e.c & 255,
-                              hex64(e.d).c_str());
+                if ((e.c & 255) == 8) {
+                    char buf[33];
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 2 * k, 3, "%02x", (unsigned)(e.d2 >> (8 * k)) & 0xFF);
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 16 + 2 * k, 3, "%02x", (unsigned)(e.d >> (8 * k)) & 0xFF);
+                    std::snprintf(line, sizeof line, "M %u %u %u %u %s", e.step, e.pc, e.c >> 8, e.c & 255, buf);
+                } else {
+                    std::snprintf(line, sizeof line, "M %u %u %u %u %s", e.step, e.pc, e.c >> 8, e.c & 255,
+                                  hex64(e.d).c_str());
+                }
                 break;
-            case m1::E_PUT: std::snprintf(line, sizeof line, "P %u %u %s", e.step, e.pc, hex64(e.d).c_str()); break;
+            case m1::E_PUT:
+                if (e.c == 3) {  // fx.printed was 3: a quad PUT
+                    char buf[33];
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 2 * k, 3, "%02x", (unsigned)(e.d2 >> (8 * k)) & 0xFF);
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 16 + 2 * k, 3, "%02x", (unsigned)(e.d >> (8 * k)) & 0xFF);
+                    std::snprintf(line, sizeof line, "P %u %u %s", e.step, e.pc, buf);
+                } else {
+                    std::snprintf(line, sizeof line, "P %u %u %s", e.step, e.pc, hex64(e.d).c_str());
+                }
+                break;
             case m1::E_PUTC: std::snprintf(line, sizeof line, "C %u %u %u", e.step, e.pc, e.c); break;
             case m1::E_NOTHING: std::snprintf(line, sizeof line, "X %u %u", e.step, e.pc); break;
             case m1::E_HALT: std::snprintf(line, sizeof line, "H"); break;
@@ -504,11 +531,35 @@ int sim(int argc, char** argv) {
         for (uint32_t k = 0; k < sink.count; k++) {
             const m1::Event& e = events[k];
             if (e.kind == m1::E_STEP) std::fprintf(out, "S %u %u\n", e.step, e.pc);
-            else if (e.kind == m1::E_REG) std::fprintf(out, "R %u %u %c%u %s\n", e.step, e.pc,
-                                                       "hfd"[e.c >> 5], e.c & 31, hex64(e.d).c_str());
-            else if (e.kind == m1::E_STORE) std::fprintf(out, "M %u %u %u %u %s\n", e.step, e.pc,
-                                                         e.c >> 8, e.c & 255, hex64(e.d).c_str());
-            else if (e.kind == m1::E_PUT) std::fprintf(out, "P %u %u %s\n", e.step, e.pc, hex64(e.d).c_str());
+            else if (e.kind == m1::E_REG) {
+                if (e.c >= m1::QUAD_BASE) {
+                    char buf[33];
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 2 * k, 3, "%02x", (unsigned)(e.d2 >> (8 * k)) & 0xFF);
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 16 + 2 * k, 3, "%02x", (unsigned)(e.d >> (8 * k)) & 0xFF);
+                    std::fprintf(out, "R %u %u q%u %s\n", e.step, e.pc, e.c & 31, buf);
+                } else {
+                    std::fprintf(out, "R %u %u %c%u %s\n", e.step, e.pc, "hfd"[e.c >> 5], e.c & 31, hex64(e.d).c_str());
+                }
+            }
+            else if (e.kind == m1::E_STORE) {
+                if ((e.c & 255) == 8) {
+                    char buf[33];
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 2 * k, 3, "%02x", (unsigned)(e.d2 >> (8 * k)) & 0xFF);
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 16 + 2 * k, 3, "%02x", (unsigned)(e.d >> (8 * k)) & 0xFF);
+                    std::fprintf(out, "M %u %u %u %u %s\n", e.step, e.pc, e.c >> 8, e.c & 255, buf);
+                } else {
+                    std::fprintf(out, "M %u %u %u %u %s\n", e.step, e.pc, e.c >> 8, e.c & 255, hex64(e.d).c_str());
+                }
+            } else if (e.kind == m1::E_PUT) {
+                if (e.c == 3) {
+                    char buf[33];
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 2 * k, 3, "%02x", (unsigned)(e.d2 >> (8 * k)) & 0xFF);
+                    for (int k = 0; k < 8; k++) std::snprintf(buf + 16 + 2 * k, 3, "%02x", (unsigned)(e.d >> (8 * k)) & 0xFF);
+                    std::fprintf(out, "P %u %u %s\n", e.step, e.pc, buf);
+                } else {
+                    std::fprintf(out, "P %u %u %s\n", e.step, e.pc, hex64(e.d).c_str());
+                }
+            }
             else if (e.kind == m1::E_PUTC) std::fprintf(out, "C %u %u %u\n", e.step, e.pc, e.c);
             else if (e.kind == m1::E_NOTHING) std::fprintf(out, "X %u %u\n", e.step, e.pc);
             else break;
@@ -524,6 +575,9 @@ int sim(int argc, char** argv) {
     std::printf("sim %s: %llu steps on the host in %.3f s (%.0f instructions a second), %s\n",
                 in_path.c_str(), (unsigned long long)c.steps, seconds,
                 seconds > 0 ? (double)c.steps / seconds : 0.0, ends);
+    if (c.status == m1::FAULTED)
+        std::fprintf(stderr, "  fault kind %u (%s) at pc %u, instr %u\n", c.fault, m1::FAULT_NAMES[c.fault], c.pc, c.pc);
+
     return 0;
 }
 

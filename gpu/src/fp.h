@@ -17,6 +17,8 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
+#include <cstdio>
 
 // M1_HD marks a function that HIP must build for the device as well as the host.
 #if defined(__HIP__)
@@ -36,7 +38,7 @@ constexpr uint64_t QUIET_NAN = 0x7FF8000000000000ULL;
 // Sticky IEEE 754 exception flags, the same bits as fp.py.
 constexpr uint32_t F_INVALID = 1, F_DIVZERO = 2, F_OVERFLOW = 4, F_UNDERFLOW = 8, F_INEXACT = 16;
 
-enum { HALF = 0, FLOAT = 1, DOUBLE = 2 };
+enum { HALF = 0, FLOAT = 1, DOUBLE = 2, QUAD = 3 };
 
 struct Format {
     int p;       // significand bits, counting the implicit leading 1
@@ -44,7 +46,8 @@ struct Format {
     int emin;    // exponent of the smallest normal binade
     int cells;   // 16-bit cells in memory
 };
-constexpr Format FORMATS[3] = {{11, 15, -14, 1}, {24, 127, -126, 2}, {53, 1023, -1022, 4}};
+constexpr Format FORMATS[4] = {{11, 15, -14, 1}, {24, 127, -126, 2}, {53, 1023, -1022, 4},
+                               {113, 16383, -16382, 8}};
 
 struct Result {
     double value;
@@ -778,6 +781,1251 @@ M1_HD inline double op_neg(double x) { return double_of(bits_of(x) ^ SIGN64); }
 M1_HD inline double op_abs(double x) { return double_of(bits_of(x) & ~SIGN64); }
 M1_HD inline double op_copysign(double x, double y) {
     return double_of((bits_of(x) & ~SIGN64) | (bits_of(y) & SIGN64));
+}
+
+// --- quad: binary128 -----------------------------------------------------------------
+//
+// A quad register holds the 128-bit pattern, as memory does.  Arithmetic
+// decodes the pattern into the three-double shape of the value: the 113-bit
+// significand splits into 53, 53 and what remains -- hi, mid, lo, every piece
+// exact -- with the binary exponent carried beside it.  Products go through
+// TwoProd on the machine's FMA (p plus the exact residual, both kept), and
+// every sum is accumulated as exact dyadic pieces, m * 2**e with m a whole
+// number, so an addition, a product or an fma is exact end to end and owes
+// one rounding.  That rounding runs through an integer window: the top p + 2
+// bits of the magnitude in a 128-bit integer, everything below folded into a
+// signed tail that breaks ties at an exact midpoint.  A sum that cancels
+// clean through its first window re-windows what is left, down as far as the
+// value actually reaches; the dyad pieces ride out the whole quad exponent
+// range, where bare doubles would underflow.  Division, square root, the
+// remainders and the other ratio-shaped operations work on the integer
+// significands directly -- u128 long division, a bit-at-a-time root, modular
+// arithmetic -- because their exact answers reach far past any expansion, and
+// the reference rounds them once from the exact value.
+//
+// Quirks of mantissa/fp.py are mirrored on purpose, the oracle being code: a
+// rounding carry that lands the significand exactly on 2**113 leaves it there
+// at the old quantum (q_from_ratio bumps est, not the quantum); MANT and the
+// integral roundings hand Quad(m, 0) to q_to_bits, whose subnormal branch
+// prints m itself as the bits; and LD of a quad reads only the four high
+// cells, because memory._bits packs four.  Operations the reference cannot
+// run at all -- its quad arithmetic raises on a NaN payload -- answer the
+// sensible IEEE thing here: a canonical quiet NaN, payload 0.
+
+constexpr int Q_P = 113, Q_EMAX = 16383, Q_EMIN = -16382, Q_CELLS = 8;
+constexpr int Q_EMIN_P1 = Q_EMIN - Q_P + 1;  // -16494, the subnormal quantum
+constexpr uint64_t QNAN_HI = 0x7FFF800000000000ULL, QNAN_LO = 0;
+constexpr u128 Q_M112 = (u128)1 << 112, Q_M113 = (u128)1 << 113;
+typedef __int128 s128;
+
+struct QRes {
+    uint64_t hi, lo;
+    uint32_t flags;
+};
+
+M1_HD inline QRes q_qnan() { return QRes{QNAN_HI, QNAN_LO, 0}; }
+
+// A decoded pattern: kind 0 zero, 1 finite, 2 infinity, 3 NaN.  A NaN loses
+// its payload here; NEG, ABS and CPSGN work on the raw bits instead.
+struct Qdec {
+    int kind, sign;
+    u128 m;
+    int e;
+};
+
+M1_HD inline Qdec q_decode(uint64_t hi, uint64_t lo) {
+    Qdec d;
+    d.sign = (int)(hi >> 63);
+    uint64_t mag = hi & ~SIGN64;
+    uint32_t field = (uint32_t)(mag >> 48);
+    u128 frac = ((u128)(mag & 0x0000FFFFFFFFFFFFULL) << 64) | lo;
+    if (field == 0x7FFF) {
+        d.kind = frac ? 3 : 2;
+        d.m = 0;
+        d.e = 0;
+        return d;
+    }
+    if (field == 0) {
+        d.kind = frac ? 1 : 0;
+        d.m = frac;
+        d.e = Q_EMIN_P1;
+        return d;
+    }
+    d.kind = 1;
+    d.m = frac | Q_M112;
+    d.e = (int)field - 16383 - 112;
+    return d;
+}
+
+// q_to_bits of fp.py, faithful to the non-canonical cases: m under 2**112
+// prints as itself (the subnormal branch), m over prints with the field e
+// carries -- which is how fp.py prints its 2**113 significand and its huge
+// integral results.
+M1_HD inline QRes q_encode_raw(int sign, u128 m, int e, uint32_t flags = 0) {
+    QRes r;
+    r.flags = flags;
+    r.hi = (uint64_t)sign << 63;
+    r.lo = 0;
+    if (m == 0) return r;
+    u128 bits;
+    if ((s128)m >= (s128)Q_M112) {
+        uint64_t field = (uint64_t)(e + 16383 + 112);
+        bits = ((u128)field << 112) | (m & (Q_M112 - 1));
+    } else {
+        bits = m;  // subnormal print, or a negative significand as fp.py's | leaves it
+    }
+    if (sign) bits |= (u128)1 << 127;
+    r.hi = (uint64_t)(bits >> 64);
+    r.lo = (uint64_t)bits;
+    return r;
+}
+
+M1_HD inline QRes q_inf_bits(int sign, uint32_t flags) {
+    QRes r = q_encode_raw(sign, 0, 0);
+    r.hi |= 0x7FFF000000000000ULL;
+    r.flags = flags;
+    return r;
+}
+
+M1_HD inline double q_dyad_value(u128 q, int e, bool neg) {
+    if (q == 0) return signed_zero(neg);  // dyad_to_double wants a nonzero q
+    return dyad_to_double((uint64_t)q, e, neg);
+}
+
+// An exact value m * 2**e, m at most 2**113, in the canonical shape
+// q_from_ratio produces: significand in [2**112, 2**113), subnormals on the
+// quantum.  The value must sit on the quad grid for the subnormal fold.
+M1_HD inline QRes q_encode_canon(int sign, u128 m, int e, uint32_t flags = 0) {
+    if (m == 0) return q_encode_raw(sign, 0, 0, flags);
+    int bl = bitlen128(m);
+    if (bl < Q_P) {
+        int up = Q_P - bl;
+        m <<= (unsigned)up;
+        e -= up;
+    }
+    if (e < Q_EMIN_P1) {
+        unsigned t = (unsigned)(Q_EMIN_P1 - e);
+        m = t < 127 ? (m >> t) : 0;
+        e = Q_EMIN_P1;
+    }
+    return q_encode_raw(sign, m, e, flags);
+}
+
+// --- exact dyadic pieces ---------------------------------------------------------------
+
+// One piece of an exact sum: +-m * 2**e with m > 0.  Chunks carry at most 53
+// bits; TwoProd residuals 53; a product piece is split before storing.
+struct Qdy {
+    u128 m;
+    int e;
+    bool neg;
+};
+
+constexpr int Q_ACC = 30;
+struct Qacc {
+    Qdy c[Q_ACC];
+    int n;
+};
+
+M1_HD inline Qdy qdy_of(double v) {  // v finite and nonzero
+    Dyad d = canon(v);
+    Qdy q;
+    q.m = (u128)d.odd;
+    q.e = d.exp;
+    q.neg = sign_bit(v);
+    return q;
+}
+
+M1_HD inline void qacc_init(Qacc& a) { a.n = 0; }
+M1_HD inline void qacc_push(Qacc& a, u128 m, int e, bool neg) {
+    if (m == 0 || a.n >= Q_ACC) return;
+    a.c[a.n].m = m;
+    a.c[a.n].e = e;
+    a.c[a.n].neg = neg;
+    a.n++;
+}
+
+M1_HD inline void q_two_prod(double a, double b, double& p, double& err) {
+    p = a * b;
+    err = fma(a, b, -p);
+}
+
+// A finite nonzero quad as its three-double chunks, placed exactly.
+M1_HD inline void q_chunks(const Qdec& d, Qacc& acc, bool neg) {
+    int bl = bitlen128(d.m);
+    int s1 = bl - 53;
+    if (s1 > 0) {
+        qacc_push(acc, d.m >> (unsigned)s1, d.e + s1, neg);
+        u128 r1 = d.m & (((u128)1 << (unsigned)s1) - 1);
+        if (r1) {
+            int bl2 = bitlen128(r1);
+            int s2 = bl2 - 53;
+            if (s2 > 0) {
+                qacc_push(acc, r1 >> (unsigned)s2, d.e + s2, neg);
+                u128 r2 = r1 & (((u128)1 << (unsigned)s2) - 1);
+                if (r2) qacc_push(acc, r2, d.e, neg);
+            } else {
+                qacc_push(acc, r1, d.e, neg);
+            }
+        }
+    } else {
+        qacc_push(acc, d.m, d.e, neg);
+    }
+}
+
+// The three doubles of an operand, materialized for TwoProd.
+M1_HD inline void q_doubles(const Qdec& d, double out[3]) {
+    out[0] = out[1] = out[2] = 0.0;
+    int bl = bitlen128(d.m);
+    int s1 = bl - 53;
+    if (s1 > 0) {
+        out[0] = dyad_to_double((uint64_t)(d.m >> (unsigned)s1), d.e + s1, d.sign);
+        u128 r1 = d.m & (((u128)1 << (unsigned)s1) - 1);
+        if (r1) {
+            int bl2 = bitlen128(r1);
+            int s2 = bl2 - 53;
+            if (s2 > 0) {
+                out[1] = dyad_to_double((uint64_t)(r1 >> (unsigned)s2), d.e + s2, d.sign);
+                u128 r2 = r1 & (((u128)1 << (unsigned)s2) - 1);
+                if (r2) out[2] = dyad_to_double((uint64_t)r2, d.e, d.sign);
+            } else {
+                out[1] = dyad_to_double((uint64_t)r1, d.e, d.sign);
+            }
+        }
+    } else {
+        out[0] = dyad_to_double((uint64_t)d.m, d.e, d.sign);
+    }
+}
+
+// A significand as up to three whole-number doubles -- the pure 53-bit chunks
+// of m, no scale -- so TwoProd between two operands stays in double range at
+// any quad scale.  The chunks' offsets within m come back through off[].
+M1_HD inline void q_offset_doubles(const Qdec& d, double out[3], int off[3]) {
+    out[0] = out[1] = out[2] = 0.0;
+    int bl = bitlen128(d.m);
+    int s1 = bl - 53;
+    if (s1 > 0) {
+        out[0] = (double)(uint64_t)(d.m >> (unsigned)s1);
+        off[0] = s1;
+        u128 r1 = d.m & (((u128)1 << (unsigned)s1) - 1);
+        if (r1) {
+            int bl2 = bitlen128(r1);
+            int s2 = bl2 - 53;
+            if (s2 > 0) {
+                out[1] = (double)(uint64_t)(r1 >> (unsigned)s2);
+                off[1] = s2;
+                u128 r2 = r1 & (((u128)1 << (unsigned)s2) - 1);
+                if (r2) {
+                    out[2] = (double)(uint64_t)r2;
+                    off[2] = 0;
+                }
+            } else {
+                out[1] = (double)(uint64_t)r1;
+                off[1] = 0;
+            }
+        }
+    } else {
+        out[0] = (double)(uint64_t)d.m;
+        off[0] = 0;
+    }
+}
+
+M1_HD inline void q_prod_pieces(const Qdec& a, const Qdec& b, Qacc& acc) {
+    // the nine TwoProd pairs of the three-double shapes, exact: each product
+    // is a whole number of at most 106 bits, kept whole (the window placement
+    // normalizes widths, so wide pieces are fine)
+    double da[3], db[3];
+    int oa[3], ob[3];
+    q_offset_doubles(a, da, oa);
+    q_offset_doubles(b, db, ob);
+    for (int i = 0; i < 3; i++) {
+        if (da[i] == 0.0) continue;
+        for (int j = 0; j < 3; j++) {
+            if (db[j] == 0.0) continue;
+            double p, err;
+            q_two_prod(da[i], db[j], p, err);
+            bool neg = a.sign != b.sign;
+            if (p != 0.0) {
+                Dyad d = canon(p);
+                qacc_push(acc, (u128)d.odd, a.e + b.e + oa[i] + ob[j] + d.exp, neg);
+            }
+            if (err != 0.0) {
+                // the residual rounds either way: it carries its own sign
+                Dyad d = canon(err);
+                bool eneg = neg ? !sign_bit(err) : sign_bit(err);
+                qacc_push(acc, (u128)d.odd, a.e + b.e + oa[i] + ob[j] + d.exp, eneg);
+            }
+        }
+    }
+}
+
+// --- one final rounding ----------------------------------------------------------------
+
+struct QRounded {
+    u128 q;
+    int e;      // the quantum exponent: the result is q * 2**e
+    uint32_t flags;
+    bool zero;  // the exact value was zero
+    bool neg;   // the sign of the value
+    bool inf;   // overflowed: q is meaningless, the answer is the sign's infinity
+};
+
+M1_HD inline int q_top(const Qdy& k) { return k.e + bitlen128(k.m) - 1; }
+
+// Compare r * 2**s against den, r and den positive, s any integer.
+M1_HD inline int q_cmp_pow2(u128 r, int s, u128 den) {
+    int br = r ? bitlen128(r) + s : 0;
+    int bd = den ? bitlen128(den) : 0;
+    if (br != bd) return br < bd ? -1 : 1;
+    if (s >= 0) {
+        if (s >= 127) return 1;
+        u128 rr = r << (unsigned)s;
+        return rr == den ? 0 : (rr < den ? -1 : 1);
+    }
+    unsigned t = (unsigned)-s;
+    if (t >= 127) return -1;
+    u128 dd = den >> t;
+    if (r != dd) return r < dd ? -1 : 1;
+    return (den & (((u128)1 << t) - 1)) ? 1 : 0;
+}
+
+// The sign of the exact sum of the pieces below the window: 0, or +-1.  A
+// piece whose neighbours sit far below it outmasses everything after it, so
+// the first wide gap settles the sign; nearer pieces fold exactly.
+struct BelowLead {
+    int sign;  // 0, or the sign of the exact sum
+    u128 m;    // the leading piece's magnitude (dominates the rest)
+    int e;
+    bool neg;
+    bool zero;
+};
+M1_HD inline BelowLead q_below_lead(Qacc& b) {
+    BelowLead out;
+    out.sign = 0;
+    out.m = 0;
+    out.e = 0;
+    if (b.n == 0) return out;
+    for (int i = 1; i < b.n; i++) {  // sort by top-bit position, descending
+        Qdy k = b.c[i];
+        int kp = q_top(k);
+        int j = i - 1;
+        while (j >= 0 && q_top(b.c[j]) < kp) {
+            b.c[j + 1] = b.c[j];
+            j--;
+        }
+        b.c[j + 1] = k;
+    }
+    bool have = false;
+    u128 rm = 0;
+    int re = 0;
+    bool rneg = false;
+    for (int i = 0; i < b.n; i++) {
+        if (!have) {
+            rm = b.c[i].m;
+            re = b.c[i].e;
+            rneg = b.c[i].neg;
+            have = true;
+            continue;
+        }
+        int gap = (re + bitlen128(rm) - 1) - q_top(b.c[i]);
+        if (gap >= 2) break;
+        u128 t = rm << (unsigned)gap;  // gap is 0 or 1
+        u128 s;
+        if (b.c[i].neg == rneg) {
+            s = t + b.c[i].m;
+        } else if (t >= b.c[i].m) {
+            s = t - b.c[i].m;
+        } else {
+            s = b.c[i].m - t;
+            rneg = b.c[i].neg;
+        }
+        if (s == 0) {
+            have = false;
+            continue;
+        }
+        rm = s;
+        int tz = ((uint64_t)rm) ? tzcnt64((uint64_t)rm) : 64 + tzcnt64((uint64_t)(rm >> 64));
+        rm >>= (unsigned)tz;
+        re += tz;
+    }
+    out.zero = !have;
+    out.m = rm;
+    out.e = re;
+    out.neg = rneg;
+    out.sign = have ? (rneg ? -1 : 1) : 0;
+    return out;
+}
+
+// Round (the sum of acc) plus a known below-mass of sign `tail` to fmt, once,
+// nearest even.  The window keeps the top p + 2 bits of the magnitude; its
+// two low bits are the guard and the round bit, and the mass under the window
+// breaks ties.  A sum that cancels clean through its window re-windows what
+// is left under it, until the value's real top turns up or nothing does.
+M1_HD inline QRounded q_round(int fmt, Qacc& acc, int tail) {
+    QRounded out;
+    const bool quad = fmt == 3;
+    const int p = quad ? Q_P : FORMATS[fmt].p;
+    const int emax = quad ? Q_EMAX : FORMATS[fmt].emax;
+    const int emin = quad ? Q_EMIN : FORMATS[fmt].emin;
+    const int quantum = emin - p + 1;
+    const int W = p + 2;
+    out.flags = 0;
+    out.inf = false;
+    out.zero = false;
+    out.neg = false;
+    out.q = 0;
+    out.e = 0;
+
+    Qacc below;
+    qacc_init(below);
+    while (true) {
+        int T = -(1 << 30);
+        for (int i = 0; i < acc.n; i++) {
+            int tp = q_top(acc.c[i]);
+            if (tp > T) T = tp;
+        }
+        const int bot = T - W + 1;  // the window's bottom position
+        qacc_init(below);
+        s128 win = 0;
+        for (int i = 0; i < acc.n; i++) {
+            const Qdy k = acc.c[i];
+            int bl = bitlen128(k.m);
+            int off = T - q_top(k);  // the piece's top, in window steps
+            if (off >= W) {
+                qacc_push(below, k.m, k.e, k.neg);
+                continue;
+            }
+            int lowb = off + bl - W;  // the piece's bits under the window bottom
+            u128 inw;
+            if (lowb <= 0) {
+                inw = lowb == 0 ? k.m : (k.m << (unsigned)(-lowb));
+            } else {
+                inw = lowb < 128 ? (k.m >> (unsigned)lowb) : 0;
+                u128 cut = lowb < 128 ? (k.m & (((u128)1 << (unsigned)lowb) - 1)) : k.m;
+                if (cut) qacc_push(below, cut, k.e, k.neg);
+            }
+            win += k.neg ? -(s128)inw : (s128)inw;
+        }
+        if (win != 0) {
+            int bt = tail;
+            BelowLead bl = q_below_lead(below);
+            if (bt == 0) bt = bl.sign;
+            bool wneg = win < 0;
+            u128 mag = (u128)(wneg ? -win : win);
+#ifdef M1_TRACE
+            std::printf("[qround] T %d mag %llx%llx bt %d n %d b0 %llx\n", T,
+                        (unsigned long long)(mag >> 64), (unsigned long long)mag, bt, acc.n,
+                        acc.n ? (unsigned long long)acc.c[0].m : 0ull);
+#endif
+            out.neg = wneg;
+            // a window of exactly a power of two with mass taken out from
+            // under it: the value's true top is one lower, and the honest
+            // window there is 2*mag - ceil(2 * below / 2**bot) -- the borrow
+            // written out, so the pieces under the window stay reachable.
+            bool shaved = wneg ? bt > 0 : bt < 0;
+            if (shaved && (mag & (mag - 1)) == 0) {
+                int cmp_b = bl.zero ? -1 : q_cmp_pow2(bl.m, bl.e - bot + 1, 1);
+                int c = cmp_b > 0 ? 2 : 1;  // ceil(2 * below / 2**bot)
+                mag = 2 * mag - (u128)c;
+                T -= 1;
+                bt = wneg ? 1 : -1;  // what is left under the window adds back
+                bl.sign = 0;
+                bl.zero = true;
+                shaved = true;
+            }
+            bool inexact = shaved || (mag & 3) != 0 || bt != 0;
+            int E = T - (W - 1) + (bitlen128(mag) - 1);  // the value's binary exponent
+            if (E > emax) {
+                out.inf = true;
+                out.flags = F_OVERFLOW | F_INEXACT;
+                return out;
+            }
+            int shift = E - T + 2;  // mag >> shift is the p-bit truncation
+            int e_out = E - p + 1;
+            u128 q;
+            if (e_out > quantum) {  // normal range
+                q = shift >= 0 ? (mag >> (unsigned)(shift > 127 ? 127 : shift))
+                               : (mag << (unsigned)(-shift > 113 ? 113 : -shift));
+                u128 gbv = shift >= 2 ? ((mag >> (unsigned)(shift - 2)) & 3)
+                                      : ((mag << (unsigned)(2 - shift)) & 3);
+                uint32_t gb = (uint32_t)gbv;
+                bool up;
+                if (gb > 2) up = true;
+                else if (gb < 2) up = false;
+                else {
+                    // at the midpoint the under-window mass decides: mass that
+                    // adds to the magnitude pushes past it, mass that shaves
+                    // the magnitude holds it under, and a mass of exactly half
+                    // is a true tie to the even
+                    int half = bl.zero ? -1 : q_cmp_pow2(bl.m, bl.e - bot + 1, 1);
+                    bool adds = half == 0 ? false : (wneg ? bt < 0 : bt > 0);
+                    bool holds = half == 0 ? false : (wneg ? bt > 0 : bt < 0);
+                    up = adds || (!adds && !holds && (q & 1));
+                }
+                if (up) q++;
+                bool carried = q == ((u128)1 << p);
+                out.flags = inexact ? F_INEXACT : 0;
+                if (out.flags && e_out < emin && q < ((u128)1 << (p - 1))) out.flags |= F_UNDERFLOW;
+                if (carried && quad) {
+                    // fp.py keeps q = 2**p at the old quantum; mirror it
+                    out.q = q;
+                    out.e = e_out;
+                    return out;
+                }
+                if (carried) {
+                    q = (u128)1 << (p - 1);
+                    e_out++;
+                }
+            } else {  // subnormal: re-round at the quantum, once
+                int s2 = W - 1 - T + quantum;
+                u128 low, half;
+                if (s2 > 127) {
+                    q = 0;
+                    low = 0;
+                    half = 2;  // the value is under a quarter quantum: no round
+                    low = mag != 0 ? 1 : 0;  // up, but the magnitude tells inexact
+                } else {
+                    low = mag & (((u128)1 << (unsigned)s2) - 1);
+                    q = mag >> (unsigned)s2;
+                    half = (u128)1 << (unsigned)(s2 - 1);
+                }
+                bool up;
+                if (low > half) up = true;
+                else if (low < half) up = false;
+                else up = bt > 0 || (bt == 0 && (q & 1));
+                if (up) q++;
+                inexact = inexact || low != 0;
+                e_out = quantum;
+                if (q == ((u128)1 << p)) {
+                    if (quad) {  // the carry quirk reaches the boundary too
+                        out.q = q;
+                        out.e = e_out;
+                        out.flags = inexact ? F_INEXACT : 0;
+                        return out;
+                    }
+                    q = (u128)1 << (p - 1);
+                    e_out++;
+                }
+                out.flags = 0;
+                if (inexact) out.flags |= F_INEXACT;
+                if (q == 0 || (inexact && q < ((u128)1 << (p - 1)))) out.flags |= F_UNDERFLOW;
+            }
+            out.q = q;
+            out.e = e_out;
+            out.zero = q == 0;
+            return out;
+        }
+        // the window cancelled clean: whatever is under it is the value
+        if (below.n == 0) {
+            out.zero = true;
+            out.neg = tail < 0;
+            return out;
+        }
+        acc = below;
+        qacc_init(below);
+    }
+}
+
+// --- exact ratios: division, conversions, scaling ----------------------------------------
+
+// Round (num/den) * 2**K to fmt, once, nearest even: fp.py's _round_ratio and
+// q_from_ratio, with the division done on u128 pieces (num, den under 2**120,
+// den > 0).  `sticky` marks exactness already known to be lost.
+M1_HD inline u128 q_modmul(u128 x, u128 y, u128 m) {
+    u128 acc = 0;
+    int bl = bitlen128(x);
+    for (int i = bl - 1; i >= 0; i--) {
+        acc <<= 1;
+        if ((x >> (unsigned)i) & 1) acc += y;
+        if (acc >= m) acc -= m;
+        if (acc >= m) acc -= m;
+    }
+    return acc;
+}
+M1_HD inline u128 q_modpow2(int d, u128 m) {  // 2**d mod m
+    if (m == 1) return 0;
+    u128 result = 1, base = 2 % m;
+    while (d > 0) {
+        if (d & 1) result = q_modmul(result, base, m);
+        d >>= 1;
+        if (d) base = q_modmul(base, base, m);
+    }
+    return result;
+}
+
+M1_HD inline QRounded q_ratio_round(int fmt, u128 num, u128 den, int K, bool sticky = false) {
+    QRounded out;
+    const bool quad = fmt == 3;
+    const int p = quad ? Q_P : FORMATS[fmt].p;
+    const int emax = quad ? Q_EMAX : FORMATS[fmt].emax;
+    const int emin = quad ? Q_EMIN : FORMATS[fmt].emin;
+    const int quantum = emin - p + 1;
+    out.zero = false;
+    out.neg = false;
+    out.inf = false;
+    out.flags = 0;
+    int bln = num ? bitlen128(num) : 0, bld = bitlen128(den);
+    int t = bln - bld;
+    int est = t - 1;
+    if (num) {
+        if (t >= 0) {
+            if (t < 128 && (num >> (unsigned)t) >= den) est++;
+        } else {
+            int k = -t;
+            u128 fl = k < 128 ? (den >> (unsigned)k) : 0;
+            bool rem = k < 128 && (den & (((u128)1 << (unsigned)k) - 1)) != 0;
+            if (num >= fl + (rem ? 1 : 0)) est++;
+        }
+    }
+    est += K;
+    int qe = est - p + 1 > quantum ? est - p + 1 : quantum;
+    int s = K - qe;
+#ifdef M1_TRACE
+    std::printf("[ratio] fmt %d bln %d bld %d est %d qe %d s %d den==1 %d\n", fmt, bln, bld, est, qe, s, (int)(den == 1));
+#endif
+    u128 q, r;
+    int s_left = 0;
+    bool inexact_tail;
+    if (s >= 0) {
+        q = den ? num / den : 0;
+        r = den ? num % den : (num ? 1 : 0);
+        unsigned room_step = (unsigned)(126 - bld);  // r << step must fit a u128
+        while (s > 0) {
+            unsigned step = (unsigned)s > 14 ? 14 : (unsigned)s;
+            if (step > room_step) step = room_step;
+            u128 num2 = r << step;
+            q = (q << step) | (num2 / den);
+            r = num2 % den;
+            s -= (int)step;
+        }
+        s_left = 0;
+        inexact_tail = r != 0;
+    } else {
+        int k = -s;
+        // q = floor(num / (den * 2**k)): the low bits never reach the divisor
+        u128 H = k < 128 ? (num >> (unsigned)k) : 0;
+        q = H / den;
+        if (den == 1) {
+#ifdef M1_TRACE
+            std::printf("[else1] k %d div_shift %d\n", k, qe - K);
+#endif
+            // my denominator folded the exponent, so fp.py's remainder
+            // (num * 2**k) mod 2**(-K) is nonzero exactly when num carries
+            // bits under the quantum's reach
+            r = 0;
+            int div_shift = qe - K;  // num must divide by 2**div_shift to be exact
+            bool exact = div_shift <= 0
+                         || (div_shift <= 126 && (num & ((((u128)1 << (unsigned)div_shift) - 1))) == 0);
+            inexact_tail = !exact;
+        } else {
+            r = q_modmul(num % den, q_modpow2(k, den), den);  // fp.py's remainder frame
+            inexact_tail = r != 0;
+        }
+        s_left = 0;
+    }
+    bool inexact = sticky || inexact_tail;
+#ifdef M1_TRACE
+    std::printf("[ratio2] r %llx inexact %d\n", (unsigned long long)r, (int)inexact);
+#endif
+    int cmp = q_cmp_pow2(r, s_left + 1, den);
+    bool up = cmp > 0 || (cmp == 0 && (q & 1));
+    if (up) q++;
+    if (q >> p) est++;
+    if (est > emax) {
+        out.inf = true;
+        out.flags = F_OVERFLOW | F_INEXACT;
+        return out;
+    }
+    out.flags = inexact ? F_INEXACT : 0;
+    if (out.flags && est < emin && (q >> (p - 1)) == 0) out.flags |= F_UNDERFLOW;
+    out.q = q;
+    out.e = qe;
+    return out;
+}
+
+M1_HD inline Result q_ratio_narrow(int fmt, int sign, u128 num, u128 den, int K, bool sticky = false) {
+    QRounded o = q_ratio_round(fmt, num, den, K, sticky);
+    if (o.inf) return {signed_inf(sign), o.flags};
+    return {q_dyad_value(o.q, o.e, sign), o.flags};
+}
+M1_HD inline QRes q_ratio_quad(int sign, u128 num, u128 den, int K, bool sticky = false) {
+    QRounded o = q_ratio_round(3, num, den, K, sticky);
+    if (o.inf) return q_inf_bits(sign, o.flags);
+    return q_encode_raw(sign, o.q, o.e, o.flags);
+}
+
+// --- sign bits, order, comparisons --------------------------------------------------------
+
+M1_HD inline QRes q_neg_bits(uint64_t hi, uint64_t lo) { return QRes{hi ^ SIGN64, lo, 0}; }
+M1_HD inline QRes q_abs_bits(uint64_t hi, uint64_t lo) { return QRes{hi & ~SIGN64, lo, 0}; }
+M1_HD inline QRes q_copysign_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t) {
+    return QRes{(ah & ~SIGN64) | (bh & SIGN64), al, 0};
+}
+
+// The exact order of two non-NaN quads: -1, 0 or 1.
+M1_HD inline int q_order3(const Qdec& a, const Qdec& b) {
+    if (a.kind == 2 || b.kind == 2) {
+        if (a.kind == 2 && b.kind == 2) return a.sign == b.sign ? 0 : (a.sign ? -1 : 1);
+        if (a.kind == 2) return a.sign ? -1 : 1;
+        return b.sign ? 1 : -1;
+    }
+    if (a.sign != b.sign) return a.sign ? -1 : 1;
+    int mag;
+    if (a.kind == 0 || b.kind == 0) {
+        mag = a.kind == 0 ? (b.kind == 0 ? 0 : -1) : 1;
+    } else {
+        int pa = bitlen128(a.m) - 1 + a.e;
+        int pb = bitlen128(b.m) - 1 + b.e;
+        if (pa != pb) mag = pa < pb ? -1 : 1;
+        else {
+            int sh = a.e - b.e;
+            u128 x, y;
+            if (sh >= 0) {
+                x = sh < 127 ? (a.m << (unsigned)sh) : 0;
+                y = b.m;
+            } else {
+                x = a.m;
+                y = -sh < 127 ? (b.m << (unsigned)-sh) : 0;
+            }
+            mag = x == y ? 0 : (x < y ? -1 : 1);
+        }
+    }
+    return a.sign ? -mag : mag;
+}
+
+M1_HD inline QRes q_min_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3) return b.kind == 3 ? q_qnan() : QRes{bh, bl, 0};
+    if (b.kind == 3) return QRes{ah, al, 0};
+    int o = q_order3(a, b);
+    if (o < 0) return QRes{ah, al, 0};
+    if (o > 0) return QRes{bh, bl, 0};
+    return a.sign ? QRes{ah, al, 0} : QRes{bh, bl, 0};  // MIN(+0, -0) is -0
+}
+M1_HD inline QRes q_max_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3) return b.kind == 3 ? q_qnan() : QRes{bh, bl, 0};
+    if (b.kind == 3) return QRes{ah, al, 0};
+    int o = q_order3(a, b);
+    if (o > 0) return QRes{ah, al, 0};
+    if (o < 0) return QRes{bh, bl, 0};
+    return a.sign ? QRes{bh, bl, 0} : QRes{ah, al, 0};  // MAX(+0, -0) is +0
+}
+
+M1_HD inline QRes q_cmp_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3 || b.kind == 3) return q_qnan();
+    int o = q_order3(a, b);
+    // fp.py's Quad(0, -1) carries a negative significand and its bits go
+    // negative, past what a trace can print; the same value as a 128-bit
+    // pattern is its two's complement.
+    u128 m = o == 0 ? 0 : (o > 0 ? 1 : ~(u128)0);
+    return q_encode_raw(0, m, 0);
+}
+M1_HD inline QRes q_lt_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3 || b.kind == 3) return q_encode_raw(0, 0, 0);  // no oracle: NaN never orders
+    return q_encode_raw(0, q_order3(a, b) < 0 ? 1 : 0, 0);
+}
+M1_HD inline QRes q_le_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3 || b.kind == 3) return q_encode_raw(0, 0, 0);
+    return q_encode_raw(0, q_order3(a, b) <= 0 ? 1 : 0, 0);
+}
+M1_HD inline QRes q_eq_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3 || b.kind == 3) return q_encode_raw(0, 0, 0);
+    return q_encode_raw(0, q_order3(a, b) == 0 ? 1 : 0, 0);
+}
+
+// --- sums and products ---------------------------------------------------------------------
+
+// The exact a + b (b's sign given separately, so subtraction reuses this),
+// settled past the infinities, zeros and NaNs.  Every piece of the lower
+// operand shifts down exactly; the window sees to what still matters.
+M1_HD inline QRounded q_sum_engine(const Qdec& a, const Qdec& b, bool bneg) {
+    bool swap = a.e < b.e;
+    const Qdec& hi = swap ? b : a;
+    const Qdec& lo = swap ? a : b;
+    bool hineg = swap ? bneg : a.sign;
+    bool lneg = swap ? a.sign : bneg;
+    Qacc acc;
+    qacc_init(acc);
+    q_chunks(hi, acc, hineg);
+    if (lo.kind != 0) q_chunks(lo, acc, lneg);  // pieces carry absolute exponents already
+    return q_round(3, acc, 0);
+}
+
+M1_HD inline QRes q_add_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3 || b.kind == 3) return q_qnan();
+    if (a.kind == 2 && b.kind == 2 && a.sign != b.sign) return q_qnan();  // inf - inf
+    if (a.kind == 2) return QRes{ah, al, 0};
+    if (b.kind == 2) return QRes{bh, bl, 0};
+    if (a.kind == 0 && b.kind == 0) return q_encode_raw(a.sign & b.sign, 0, 0);
+    QRounded o = q_sum_engine(a, b, b.sign);
+    if (o.zero && o.flags == 0) return q_encode_raw(0, 0, 0);  // x + (-x) is +0
+    if (o.inf) return q_inf_bits(o.neg, o.flags);
+    return q_encode_raw(o.neg, o.q, o.e, o.flags);
+}
+M1_HD inline QRes q_sub_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    // q_add(a, q_neg(b)): the zero-sign rules fall out as fp.py's do
+    return q_add_bits(ah, al, bh ^ SIGN64, bl);
+}
+
+M1_HD inline QRes q_mul_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3 || b.kind == 3) return q_qnan();
+    int sign = a.sign ^ b.sign;
+    if ((a.kind == 2 && (b.kind == 2 || b.kind == 0)) || (a.kind == 0 && b.kind == 2)) return q_qnan();
+    if (a.kind == 2 || b.kind == 2) return q_inf_bits(sign, 0);
+    if (a.kind == 0 || b.kind == 0) return q_encode_raw(sign, 0, 0);
+    Qacc acc;
+    qacc_init(acc);
+    q_prod_pieces(a, b, acc);
+    QRounded o = q_round(3, acc, 0);
+    if (o.zero && o.flags == 0) return q_encode_raw(sign, 0, 0);
+    if (o.inf) return q_inf_bits(sign, o.flags);
+    return q_encode_raw(o.neg, o.q, o.e, o.flags);
+}
+
+M1_HD inline QRes q_fma_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl, uint64_t ch, uint64_t cl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl), c = q_decode(ch, cl);
+    if (a.kind == 3 || b.kind == 3 || c.kind == 3) return q_qnan();
+    int ab_sign = a.sign ^ b.sign;
+    if ((a.kind == 2 && b.kind == 0) || (a.kind == 0 && b.kind == 2)) return q_qnan();
+    if (a.kind == 2 || b.kind == 2) {
+        if (c.kind == 2 && ab_sign != c.sign) return q_qnan();
+        return q_inf_bits(ab_sign, 0);
+    }
+    if (c.kind == 2) return QRes{ch, cl, 0};
+    if (a.kind == 0 || b.kind == 0) {
+        if (c.kind != 0) return QRes{ch, cl, 0};
+        return q_encode_raw(ab_sign & c.sign, 0, 0);
+    }
+    Qacc acc;
+    qacc_init(acc);
+    q_prod_pieces(a, b, acc);
+    if (c.kind != 0) q_chunks(c, acc, c.sign);  // absolute exponents; the window aligns
+    QRounded o = q_round(3, acc, 0);
+    if (o.zero && o.flags == 0) return q_encode_raw(ab_sign & c.sign, 0, 0);
+    if (o.inf) return q_inf_bits(o.neg, o.flags);
+    return q_encode_raw(o.neg, o.q, o.e, o.flags);
+}
+
+// --- division -------------------------------------------------------------------------------
+
+M1_HD inline QRes q_div_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3 || b.kind == 3) return q_qnan();
+    int sign = a.sign ^ b.sign;
+    if ((a.kind == 2 && b.kind == 2) || (a.kind == 0 && b.kind == 0)) return q_qnan();
+    if (a.kind == 2) return q_encode_raw(sign, 0, 0);
+    if (b.kind == 2) return q_encode_raw(sign, 0, 0);
+    if (b.kind == 0) return q_inf_bits(sign, F_DIVZERO);
+    if (a.kind == 0) return q_encode_raw(sign, 0, 0);
+    return q_ratio_quad(sign, a.m, b.m, a.e - b.e);
+}
+
+// --- square root: a bit-at-a-time root of the significand -----------------------------------
+
+// floor(sqrt(m << S)) with a bit-at-a-time root over four limbs
+M1_HD inline u128 q_isqrt(u128 m, int S) {
+    uint64_t R[4] = {0, 0, 0, 0};
+    R[0] = (uint64_t)m;
+    R[1] = (uint64_t)(m >> 64);
+    for (int k = 0; k < S; k++) {
+        R[3] = (R[3] << 1) | (R[2] >> 63);
+        R[2] = (R[2] << 1) | (R[1] >> 63);
+        R[1] = (R[1] << 1) | (R[0] >> 63);
+        R[0] <<= 1;
+    }
+    int hp = 0;
+    for (int limb = 3; limb >= 0; limb--) {
+        if (R[limb]) {
+            hp = limb * 64 + 63 - __builtin_clzll(R[limb]);
+            break;
+        }
+    }
+    int npairs = (hp >> 1) + 1;
+    u128 rem = 0, root = 0;
+    for (int k = npairs - 1; k >= 0; k--) {
+        uint64_t pair = (R[k >> 5] >> ((k & 31) * 2)) & 3;
+        rem = (rem << 2) | pair;
+        u128 t = (root << 2) + 1;
+        if (rem >= t) {
+            rem -= t;
+            root = (root << 1) | 1;
+        } else {
+            root <<= 1;
+        }
+    }
+    return root;
+}
+
+M1_HD inline QRes q_sqrt_bits(uint64_t hi, uint64_t lo) {
+    Qdec a = q_decode(hi, lo);
+    if (a.kind == 3) return q_qnan();
+    if (a.kind == 2 && !a.sign) return QRes{hi, lo, 0};
+    if (a.sign && a.kind != 0) return QRes{QNAN_HI, QNAN_LO, F_INVALID};
+    if (a.kind == 0 || a.kind == 2) return QRes{hi, lo, 0};
+    // fp.py: s = isqrt((na << 242) // da), the answer s / 2**121, once.  The
+    // radicand is a.m * 2**(a.e + 242), floored to a whole number, so deep
+    // values truncate to nothing and answer zero with the flags clear.
+    int E = a.e + 242;
+    u128 mag = a.m;
+    if (E < 0) {
+        int t = -E;
+        u128 T = t < 127 ? (mag >> (unsigned)t) : 0;
+        if (T == 0) return q_encode_raw(0, 0, 0);
+        u128 root = q_isqrt(T, 0);
+        return q_ratio_quad(0, root, (u128)1 << 121, 0);
+    }
+    if (E & 1) {
+        mag <<= 1;
+        E -= 1;
+    }
+    int S = 238 - bitlen128(mag);
+    S &= ~1;
+    if (S > E) S = E & ~1;
+    if (S < 0) S = 0;
+    u128 root = q_isqrt(mag, S);
+    int g = (E - S) / 2;
+    return q_ratio_quad(0, root, (u128)1 << 121, g);
+}
+
+// x * y mod m, x and y under m <= 2**113: schoolbook, one bit at a time.
+M1_HD inline QRes q_rem_bits(uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl, int kind) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3 || b.kind == 3) return q_qnan();
+    if (a.kind == 2 || b.kind != 1) return QRes{QNAN_HI, QNAN_LO, F_INVALID};  // a inf, or b zero-or-inf
+    if (a.kind == 0) return QRes{ah, al, 0};
+    int d = a.e - b.e;
+    u128 mag;
+    int scale;
+    bool up = false;
+    if (d >= 0) {
+        scale = b.e;
+        if (d <= 14) {
+            u128 shifted = a.m << (unsigned)d;  // fits: d <= 14, m < 2**113
+            mag = shifted % b.m;
+            if (kind == 0) {  // REM rounds to the nearest multiple
+                u128 qq = shifted / b.m;
+                u128 r2 = mag << 1;
+                up = r2 > b.m || (r2 == b.m && (qq & 1));
+            }
+        } else {
+            mag = q_modmul(a.m % b.m, q_modpow2(d, b.m), b.m);
+            if (kind == 0) {
+                u128 m2 = b.m << 1;
+                u128 par = q_modmul(a.m % m2, q_modpow2(d, m2), m2);
+                u128 r2 = mag << 1;
+                up = r2 > b.m || (r2 == b.m && (par >= b.m));
+            }
+        }
+        if (up) mag = b.m - mag;
+    } else {
+        // |a| < |b|: the quotient is 0 and the floor remainder is a itself;
+        // REM rounds to b instead only when a is past b/2
+        int K = -d;
+        // up <=> |a| past |b|/2 <=> b.m * 2**K under 2 * a.m
+        up = kind == 0 && q_cmp_pow2(b.m, K, a.m << 1) < 0;
+        if (up) {
+            // mag = b.m * 2**K - a.m; up implies b.m * 2**(K-1) < a.m < 2**113,
+            // so b.m << K fits comfortably
+            mag = (b.m << (unsigned)K) - a.m;
+        } else {
+            mag = a.m;
+        }
+        scale = a.e;
+    }
+    if (mag == 0) return q_encode_raw(a.sign, 0, 0);  // a zero remainder takes a's sign
+    // fp.py's num_r is built from magnitudes: rounding up is what makes the
+    // printed remainder negative, never a's own sign
+    return q_encode_canon(up ? 1 : 0, mag, scale);
+}
+
+// --- exponent surgery, neighbors, classification --------------------------------------------
+
+M1_HD inline int q_trunc_exp(const Qdec& n) {  // the quad n as a whole exponent, clamped
+    if (n.kind == 0) return 0;
+    if (n.kind == 2) return n.sign ? -70000 : 70000;
+    if (n.e >= 0) return n.sign ? -70000 : 70000;  // a normal is at least 2**112
+    int k = -n.e;
+    u128 v = k < 127 ? (n.m >> (unsigned)k) : 0;
+    if (v > 70000) return n.sign ? -70000 : 70000;
+    int r = (int)v;
+    return n.sign ? -r : r;
+}
+
+M1_HD inline QRes q_scalb_bits(uint64_t xh, uint64_t xl, uint64_t nh, uint64_t nl) {
+    Qdec x = q_decode(xh, xl), n = q_decode(nh, nl);
+    if (x.kind == 3 || n.kind == 3) return q_qnan();
+    if (x.kind == 0 || x.kind == 2) return QRes{xh, xl, 0};
+    int nn = q_trunc_exp(n);
+    return q_ratio_quad(x.sign, x.m, 1, x.e + nn);
+}
+
+M1_HD inline QRes q_logb_bits(uint64_t hi, uint64_t lo) {
+    Qdec a = q_decode(hi, lo);
+    if (a.kind == 3) return q_qnan();
+    if (a.kind == 0 || a.kind == 2) return q_inf_bits(1, F_DIVZERO);  // fp.py: a.m == 0 first
+    int e = a.e + bitlen128(a.m) - 1;
+    if (bitlen128(a.m) <= Q_P - 1) e = Q_EMIN;  // a subnormal counts as the smallest normal
+    return q_encode_raw(0, (u128)e, 0);  // Quad(0, e): prints as the subnormal its code is
+}
+
+M1_HD inline QRes q_next_bits(uint64_t xh, uint64_t xl, uint64_t yh, uint64_t yl) {
+    Qdec x = q_decode(xh, xl), y = q_decode(yh, yl);
+    if (x.kind == 3 || y.kind == 3) return q_qnan();
+    if (q_order3(x, y) == 0) return QRes{yh, yl, 0};
+    if (x.m == 0)  // zero and infinity alike: the step is the least subnormal
+        return q_encode_raw(0, y.sign ? ((u128)1 << 127) | 1 : 1, 0);
+    // to_bits(Q, a) +- 1, overflow where fp.py says so
+    bool xp = !x.sign;
+    bool bits_inc = (q_order3(y, x) > 0) == xp;  // (fb > fa) == (fa > 0)
+    u128 bits = ((u128)xh << 64) | xl;
+    bits += bits_inc ? 1 : ~(u128)0;
+    QRes r;
+    r.hi = (uint64_t)(bits >> 64);
+    r.lo = (uint64_t)bits;
+    r.flags = ((bits & ~((u128)1 << 127)) == ((u128)0x7FFF << 112)) ? (uint32_t)(F_OVERFLOW | F_INEXACT) : 0;
+    return r;
+}
+
+M1_HD inline QRes q_class_bits(uint64_t hi, uint64_t lo) {
+    Qdec a = q_decode(hi, lo);
+    u128 code;
+    if (a.kind == 3) code = 1;  // QNAN
+    else if (a.kind == 2) code = a.sign ? 2 : 9;  // NINF, PINF
+    else if (a.kind == 0) code = a.sign ? 5 : 6;  // NZERO, PZERO
+    else if (a.sign) code = bitlen128(a.m) <= Q_P - 1 ? 4 : 3;  // NSUBNORMAL, NNORMAL
+    else code = bitlen128(a.m) <= Q_P - 1 ? 7 : 8;  // PSUBNORMAL, PNORMAL
+    return q_encode_raw(0, code, 0);
+}
+
+// --- integral roundings: exact, with fp.py's raw prints -------------------------------------
+
+M1_HD inline QRes q_integral_bits(int kind, uint64_t hi, uint64_t lo) {
+    Qdec a = q_decode(hi, lo);
+    if (a.kind == 3) return q_qnan();
+    if (a.kind == 2 || a.kind == 0) return QRes{hi, lo, 0};
+    bool sx = a.sign;
+    u128 q;
+    bool inexact;
+    if (a.e >= 0) {  // already whole: Quad(m * 2**e, 0), printed raw
+        int bl = bitlen128(a.m) + a.e;
+        u128 bits;
+        if (bl >= 113) {
+            u128 lowm = a.e >= 112 ? 0 : ((a.m << (unsigned)a.e) & (Q_M112 - 1));
+            bits = ((u128)(uint64_t)16495 << 112) | lowm;
+        } else {
+            bits = a.m << (unsigned)a.e;
+        }
+        if (sx) bits |= (u128)1 << 127;
+        QRes r;
+        r.hi = (uint64_t)(bits >> 64);
+        r.lo = (uint64_t)bits;
+        r.flags = 0;
+        return r;
+    }
+    int k = -a.e;
+    if (k >= 128) {
+        q = 0;
+        inexact = a.m != 0;
+        if (kind == 0 && sx && inexact) q = 1;        // floor
+        else if (kind == 1 && !sx && inexact) q = 1;  // ceil
+        // trunc and round-even stay at zero: the value is under half
+    } else {
+        q = a.m >> (unsigned)k;
+        u128 r = a.m & (((u128)1 << (unsigned)k) - 1);
+        inexact = r != 0;
+        u128 den = (u128)1 << (unsigned)k;
+        if (kind == 0) {  // floor
+            if (sx && r) q++;
+        } else if (kind == 1) {  // ceil
+            if (!sx && r) q++;
+        } else if (kind == 3) {  // round even
+            u128 r2 = r << 1;
+            if (r2 > den || (r2 == den && (q & 1))) q++;
+        }  // trunc: nothing
+    }
+    if (q == 0) return q_encode_raw(sx, 0, 0, F_INEXACT);  // a nonzero x lost everything
+    return q_encode_raw(sx, q, 0, inexact ? F_INEXACT : 0);
+}
+
+// --- on-grid roundings ----------------------------------------------------------------------
+
+M1_HD inline int q_floorlog_ratio(u128 num, u128 den) {  // floor(log2(num/den)), both > 0
+    int t = bitlen128(num) - bitlen128(den);
+    int est = t - 1;
+    if (t >= 0) {
+        if (t < 128 && (num >> (unsigned)t) >= den) est++;
+    } else {
+        int k = -t;
+        u128 fl = k < 128 ? (den >> (unsigned)k) : 0;
+        bool rem = k < 128 && (den & (((u128)1 << (unsigned)k) - 1)) != 0;
+        if (num >= fl + (rem ? 1 : 0)) est++;
+    }
+    return est;
+}
+
+M1_HD inline QRes q_grid_bits(int kind, uint64_t xh, uint64_t xl, uint64_t sh, uint64_t sl) {
+    Qdec x = q_decode(xh, xl), st = q_decode(sh, sl);
+    if (x.kind == 3 || st.kind == 3) return q_qnan();
+    if (st.kind == 0 || st.kind == 2 || x.kind == 2) return QRes{QNAN_HI, QNAN_LO, F_INVALID};
+    if (x.kind == 0) return QRes{xh, xl, 0};
+    bool sx = x.sign;
+    // the quotient |x| / |step| = (x.m / st.m) * 2**(x.e - st.e), exact
+    int fl = q_floorlog_ratio(x.m, st.m) + (x.e - st.e);
+    if (fl >= 126) {
+        // the quotient is giant: fp.py rounds the exact multiple once and its
+        // rounding carries past 2**113, which the quirk then prints at the old
+        // quantum -- half of x, fraction zero, for both the exact and the
+        // inexact multiple.  A vanishing quotient takes x's sign instead.
+        int x_exp = x.e + bitlen128(x.m) - 1;
+        int d = x.e - st.e;
+        bool exact;
+        if (d >= 0) {
+            u128 rem = d <= 14 ? ((x.m << (unsigned)d) % st.m)
+                               : q_modmul(x.m % st.m, q_modpow2(d, st.m), st.m);
+            exact = rem == 0;
+        } else {
+            int k = -d;  // unreachable: mx/ms < 2**113 bounds d below; kept for safety
+            u128 rem = k <= 14 ? (x.m % (st.m << (unsigned)k)) : x.m;
+            exact = rem == 0;
+        }
+        if (exact || x.m != Q_M112)
+            return QRes{xh & ~SIGN64, xl, exact ? 0 : F_INEXACT};  // the multiple rounds back to x
+        // x is a power of two and the multiple sits just under it: fp.py's
+        // floor log drops, the quantum halves, and the rounding carries into
+        // 2**113 -- which the quirk prints at the old quantum, halved
+        return q_encode_raw(0, Q_M113, x_exp - 113, F_INEXACT);
+    }
+    // the exact quotient, every bit of it
+    u128 q, r;
+    int s = x.e - st.e;
+    if (s >= 0) {
+        q = x.m / st.m;
+        r = x.m % st.m;
+        while (s > 0) {
+            unsigned step = (unsigned)s > 14 ? 14 : (unsigned)s;
+            u128 num2 = r << step;
+            q = (q << step) | (num2 / st.m);
+            r = num2 % st.m;
+            s -= (int)step;
+        }
+    } else {
+        int k = -s;
+        if (k <= 14) {
+            u128 dd = st.m << (unsigned)k;
+            q = x.m / dd;
+            r = x.m % dd;
+        } else {
+            // the quotient is a fraction: r is nonzero and below the divisor
+            q = 0;
+            r = x.m;  // 0 < r < den, by the divisor's own scale
+        }
+    }
+    // choose the multiple by kind, on the magnitude: fp.py's choose sees the
+    // positive fraction, so the multiple is positive and only an exact zero
+    // of it takes x's sign
+    u128 mq = q;
+    int cmp2 = q_cmp_pow2(st.m, s < 0 ? -s : 0, x.m << 1);  // 2r vs den, any scale
+    if (kind == 1) {  // ceil
+        if (r) mq++;
+    } else if (kind == 3) {  // nearest, ties to the even multiple
+        if (cmp2 < 0) mq++;
+        else if (cmp2 == 0 && (q & 1)) mq++;
+    }  // floor, trunc: the floor of a positive fraction
+    if (mq == 0) return q_encode_raw(sx, 0, 0, F_INEXACT);
+    if (bitlen128(mq) + bitlen128(st.m) <= 126)
+        return q_ratio_quad(0, mq * st.m, 1, st.e, r != 0);
+    // the multiple needs more bits than a u128: it is within two steps of x,
+    // and a step is under a quarter ulp of x there, so x is the rounding
+    return QRes{xh & ~SIGN64, xl, r ? F_INEXACT : 0u};
+}
+
+// --- mantissa, split, join, conversions -----------------------------------------------------
+
+// MANT's m and e as fp.py's q_mantissa builds them, raw prints included.
+M1_HD inline QRes q_mant_m_bits(uint64_t hi, uint64_t lo) {
+    Qdec a = q_decode(hi, lo);
+    if (a.kind == 3) return q_qnan();
+    if (a.kind == 0 || a.kind == 2) return QRes{hi, lo, 0};  // zero and infinity pass through
+    int shift = bitlen128(a.m);
+    return q_encode_raw(a.sign, a.m, a.e - shift);
+}
+M1_HD inline QRes q_mant_e_bits(uint64_t hi, uint64_t lo) {
+    Qdec a = q_decode(hi, lo);
+    if (a.kind == 3) return q_qnan();
+    if (a.kind == 0 || a.kind == 2) return q_encode_raw(0, 0, 0);
+    return q_encode_raw(0, (u128)bitlen128(a.m), 0);
+}
+
+// SPLIT of a quad into a narrow format: the low half is x - high, exact.
+M1_HD inline Result q_split_low(int dst, uint64_t xh, uint64_t xl, double high, uint32_t& flags) {
+    Qdec x = q_decode(xh, xl);
+    if (is_inf(high)) {  // fp.py raises here (Fraction of an infinity); answer -inf
+        flags = F_INEXACT;
+        return {signed_inf(!sign_bit(high)), 0};
+    }
+    Qacc acc;
+    qacc_init(acc);
+    q_chunks(x, acc, x.sign);
+    Dyad hd = canon(high);
+    qacc_push(acc, (u128)hd.odd, hd.exp, sign_bit(high));
+    QRounded o = q_round(dst, acc, 0);
+    flags = o.flags & F_INEXACT;
+    if (o.inf) return {signed_inf(o.neg), o.flags};
+    return {q_dyad_value(o.q, o.e, o.neg), o.flags};
+}
+
+// JOIN with a quad operand: the exact sum, rounded once to dst.  (Into a
+// narrow format fp.py stores the quad object itself in the register, which a
+// 64-bit cell cannot hold; this rounds the same exact sum once to dst.)
+M1_HD inline QRes q_join_bits(int dst, uint64_t ah, uint64_t al, uint64_t bh, uint64_t bl) {
+    Qdec a = q_decode(ah, al), b = q_decode(bh, bl);
+    if (a.kind == 3 || b.kind == 3) {
+        if (dst == 3) return q_qnan();
+        return QRes{QUIET_NAN, 0, 0};
+    }
+    if (a.kind == 2 || b.kind == 2) {
+        if (a.kind == 2 && b.kind == 2 && a.sign != b.sign) {
+            if (dst == 3) return q_qnan();
+            return QRes{QUIET_NAN, 0, F_INVALID};
+        }
+        uint64_t ih = a.kind == 2 ? ah : bh, il = a.kind == 2 ? al : bl;
+        if (dst == 3) return QRes{ih, il, 0};
+        return QRes{bits_of(signed_inf(sign_bit(ih))), 0, 0};
+    }
+    Qacc acc;
+    qacc_init(acc);
+    if (a.kind != 0) q_chunks(a, acc, a.sign);
+    if (b.kind != 0) q_chunks(b, acc, b.sign);
+    QRounded o = q_round(dst, acc, 0);
+    if (o.zero && o.flags == 0) return q_encode_raw(a.sign & b.sign, 0, 0);
+    if (o.inf) return q_inf_bits(o.neg, o.flags);
+    if (dst == 3) return q_encode_raw(o.neg, o.q, o.e, o.flags);
+    return QRes{bits_of(q_dyad_value(o.q, o.e, o.neg)), 0, o.flags};
+}
+
+// A quad moved into a narrow format, rounding once (fp.q_convert).
+M1_HD inline Result q_to_fmt(int dst, uint64_t hi, uint64_t lo) {
+    Qdec a = q_decode(hi, lo);
+    if (a.kind == 3) return {nan_value(), 0};
+    if (a.kind == 2) return {signed_inf(a.sign), 0};
+    if (a.kind == 0) return {signed_zero(a.sign), 0};
+    return q_ratio_narrow(dst, a.sign, a.m, 1, a.e);
+}
+
+// A double moved into quad: every double is exact there (fp.convert_into_q).
+M1_HD inline QRes q_from_double(double x) {
+    if (is_nan(x)) return q_qnan();
+    if (x == 0.0) return q_encode_raw(sign_bit(x), 0, 0);
+    if (is_inf(x)) return q_encode_raw(sign_bit(x), 0, 0);
+    Dyad d = canon(x);
+    return q_encode_canon(sign_bit(x), (u128)d.odd, d.exp);
 }
 
 }  // namespace m1
