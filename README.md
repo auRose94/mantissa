@@ -41,6 +41,7 @@ Needs Python 3.10 or newer and nothing else.  From this directory:
     python -m mantissa run programs/pairs.mant
     python -m mantissa run programs/pointers.mant
     python -m mantissa run programs/quad.mant
+    python3 gpu/python/screen.py programs/plasma.mant --pngs frames   # the machine paints, the console watches
     python -m mantissa disasm programs/smc_edit.mant
     python programs/mandel_zoom.py
     python -m unittest discover -s tests -t .
@@ -352,7 +353,8 @@ is an address fault, which is what the machine does to everybody.
     programs/   the demos, and the Mandelbrot zoom tour
     compiler/   m4c.py: a compiler for a small float-only language, arrays included
     gpu/        the HIP port: co-simulation, the host simulator (61M instructions
-                a second), array mode, SIMD, and Mantissa Dodge
+                a second), array mode, SIMD, Mantissa Dodge, and the screen
+                console (a framebuffer convention plus ffmpeg)
     fpga/       the soft core: every golden trace replayed, vector instructions
                 included, Yosys cell counts, and a program fuzzer
     tests/      the arithmetic against exact arithmetic, then everything else

@@ -1,0 +1,49 @@
+; plasma.mant -- the screen device's painter: a framebuffer, painted forever.
+;
+; The framebuffer is the row of doubles at `fb`: 64 by 48 pixels, one pixel
+; per double, row major, top left first, the colour packed as
+; r*65536 + g*256 + b -- exact in a double, just under the float wall.  The
+; console (gpu/python/screen.py) runs this program in step bursts and reads
+; the cells: the machine paints, the console watches.
+;
+; The picture: three moving diagonal stripes, one per channel --
+;   r = (x + t) mod 256      g = (y + t) mod 256      b = (x + y) mod 256
+; t is the frame counter in d7, and the loops walk the framebuffer with a
+; float pointer (the screen device's favourite idiom: a base and an offset).
+
+        LDI.F  f3, 4           ; the pixel stride: one double, four cells
+        LDI.D  d6, 256         ; the colour modulus
+        LDI.D  d12, 1          ; the counters' step
+        LDI.D  d13, 64         ; the width
+        LDI.D  d14, 48         ; the height
+        LDI.D  d7, 0           ; t, the frame count
+frame:
+        LDI.F  f0, fb          ; the pixel pointer, back to the corner
+        MOV.D  d3, d12
+        SUB.D  d3, d3, d12     ; y = 0
+row:
+        MOV.D  d4, d12
+        SUB.D  d4, d4, d12     ; x = 0
+px:
+        ADD.D  d5, d4, d7      ; the counters live as doubles, so every channel
+        MOD.D  d5, d5, d6      ;   is arithmetic of one type: r = (x + t) mod 256
+        ADD.D  d8, d3, d7
+        MOD.D  d8, d8, d6      ; g = (y + t) mod 256
+        ADD.D  d9, d4, d3
+        MOD.D  d9, d9, d6      ; b = (x + y) mod 256
+        LDI.D  d11, 256
+        MUL.D  d10, d5, d11
+        MUL.D  d10, d10, d11   ; r * 65536, by two steps of 256
+        FMA.D  d10, d8, d11    ; + g * 256 (the FMA's rd is its own accumulator)
+        ADD.D  d10, d10, d9    ; + b: the pixel, packed
+        ST.D   [f0], d10       ; paint
+        ADD.F  f0, f0, f3      ; the pointer walks on
+        ADD.D  d4, d4, d12     ; x += 1
+        LT.D   d15, d4, d13
+        BNZ.D  d15, px         ; while x < 64
+        ADD.D  d3, d3, d12     ; y += 1
+        LT.D   d15, d3, d14
+        BNZ.D  d15, row        ; while y < 48
+        ADD.D  d7, d7, d12     ; t += 1: the stripes move
+        BR     frame
+fb:     SPACE  12288           ; 64 * 48 doubles
