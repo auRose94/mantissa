@@ -71,6 +71,18 @@ console that watches it:
   `base + (z*Y + y)*X + x`; the compiler can know this and emit the address
   arithmetic.  Nothing in the machine changes.
 
+The address ramp (2026-11-24) is what makes the fat end of this real: `LD`
+and `ST` now read their address from any register, and the pointer's type is
+its reach -- a half reaches 2,048 cells, a float 2^24 (32 MiB), a double
+2^53, about 18,014 TB of cells.  A 4K framebuffer at one double per pixel is
+33 million cells -- past the float wall, a double's everyday errand.  A
+512^3 voxel volume is 134 million cells; same story.  A `SPLIT` pair carries
+a cell number past the float wall and `JOIN` hands it to a double pointer:
+far pointers, with `CVT` as the cast.  Jump targets stay floats -- a half
+link that rounds a return address is a crash, not a pointer.  The OOP door
+this opens is ordinary: objects at double pointers, fields as base+offset
+pairs, vtables as float function pointers under the 32 MiB of code.
+
 The useful rule for all of these: the machine computes, the console watches.
 No instruction ever touches a window.
 

@@ -259,7 +259,6 @@ class Errors(unittest.TestCase):
             ("ADD f0, f1, f2, f3", "ADD takes 3 operands, not 4"),
             ("LDI.H h32, 1", "not a register"),
             ("LDI.H x0, 1", "not a register"),
-            ("LD.H h0, [h1]", "float register"),
             ("LD.H h0, f1", "memory operand"),
             ("ST.H h0, h1", "memory operand"),
             ("ST.H [f0], f1", "written for halfs here, but f1 holds a float"),

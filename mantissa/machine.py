@@ -161,11 +161,12 @@ def _execute(cpu, mem, out):
         return _write(cpu, a, value, pc + spec.cells, flags | fl)
 
     if op == OP["LD"]:
-        _need(file_of(b) == FLOAT, "LD reads its address from a float register")
+        # the address may come from any file: a pointer's type is its reach
+        # (half 2048 cells, float 2^24, double 2^53); the memory still faults
+        # on anything that is not a whole, in-range, aligned cell number
         return _write(cpu, a, mem.load(_format(a), _read(cpu, b)), pc + 4, flags)
 
     if op == OP["ST"]:
-        _need(file_of(a) == FLOAT, "ST reads its address from a float register")
         mem.store(_format(b), _read(cpu, a), _read(cpu, b))
         return _with_pc(cpu, pc + 4)
 

@@ -1,0 +1,33 @@
+; pointers.mant -- a pointer's type is its reach.
+;
+; LD and ST read their address from any register: a half pointer reaches
+; 2,048 cells, a float pointer 16,777,216 (32 MiB), a double pointer
+; 2^53 -- about 18,014 TB of cells.  The precision ramp is the addressing
+; ramp, and CVT is the pointer cast.  Whatever the file, the memory still
+; faults on an address that is not a whole, in-range, aligned cell number.
+; Jump targets remain floats: a half link that rounds a return address is
+; a crash, not a pointer.
+        LDI.H  h0, 8           ; a half pointer, two cells past the base
+        LDI.H  h1, 4660        ; the data: representable in a half exactly
+        ST.H   [h0], h1        ; store through the half pointer
+        LD.H   h2, [h0]
+        PUT.H  h2              ; 4660
+
+        LDI.F  f0, buf         ; a float pointer: the base half
+        LDI.F  f1, 4           ; and the offset half: four cells in
+        ADD.F  f2, f0, f1      ; the pair combined -- the pointer idiom
+        LDI.D  d0, 250
+        ST.D   [f2], d0        ; store through the float pointer
+        LD.D   d1, [f2]
+        PUT.D  d1              ; 250
+
+        LDI.D  d2, 100000000000 ; far past the float wall
+        SPLIT  f3, f4, d2      ; the pair carries it, exact
+        JOIN   d3, f3, f4      ; back to one double
+        PUT.D  d3              ; 100000000000
+
+        LDI.D  d4, buf         ; a double pointer to the same buffer
+        LD.D   d5, [d4]        ; read through it: a cell no float could name is
+        PUT.D  d5              ; 0.0   one CVT away, and 2^53 cells are in reach
+        HALT
+buf:    SPACE 8

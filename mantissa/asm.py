@@ -314,8 +314,11 @@ class _Assembler:
                 raise AsmError(lineno, f"'{text}' should be a memory operand such as [f3]")
             text = match[1]
         file_number, index = self._register(text, lineno)
-        if kind != "R" and file_number != 2:
-            raise AsmError(lineno, f"an address lives in a float register, and '{text}' is not one")
+        if kind == "A" and file_number != 2:
+            # a jump target stays a float: a half link that rounds a return
+            # address is a crash, not a pointer.  Data addresses take any
+            # file -- a pointer's type is its reach
+            raise AsmError(lineno, f"a jump target lives in a float register, and '{text}' is not one")
         return file_number, index
 
     @staticmethod

@@ -9,9 +9,9 @@ implementations that agree line for line: a Python reference, a HIP GPU port,
 and an FPGA soft core.
 
 Every value in memory is a half, a float or a double. There is nothing else to
-put in a register: no integers, no characters, no pointers. Addresses are
-floats, the program counter is a float, a loop counter is a float, and so is
-every instruction.
+put in a register: no integers, no characters. The program counter is a float,
+a loop counter is a float, and so is every instruction. An address can live in
+any register -- and a pointer's type is its reach:
 
 An instruction is a whole number, eight decimal digits long, stored as a
 double. A program can read its own instructions, do arithmetic on them and
@@ -75,8 +75,22 @@ multiple of its own width.
 type.  By convention `sp` is `f31` (the runner starts it at the top of
 memory) and `lr` is `f30`.
 
-**Addresses** are floats holding cell numbers, which caps the address space
-at 2^24 cells: 24 bits is all a float's significand has.
+**Addresses** are numbers naming cells. `LD` and `ST` read them from any
+register, and the register's format is how far the pointer reaches -- the
+precision ramp is the addressing ramp:
+
+| pointer | reaches | cells | bytes of cells |
+|---|---|---|---|
+| `.H` half | 2,048 cells | 2,048 | 4 KiB |
+| `.F` float | 16,777,216 cells | 2^24 | 32 MiB |
+| `.D` double | 9,007,199,254,740,992 cells | 2^53 | 18,014 TB |
+
+Whatever the file, the memory faults on an address that is not a whole,
+in-range, aligned cell number, exactly as before. `CVT` is the pointer cast:
+a `SPLIT` pair carries a cell number past the float wall, `JOIN` puts it in a
+double, and a load through it lands where one float could never point. Jump
+targets stay floats -- a half link that rounds a return address is a crash,
+not a pointer. (`programs/pointers.mant`)
 
 **Instructions are numbers.**  An instruction is a double whose value is an
 eight-digit decimal number:
@@ -123,8 +137,8 @@ is optional: every register already says what type it holds.
 | 02 | `HALT` | |
 | 10 | `MOV r, r` | copy |
 | 11 | `LDI r, value` | load an inline operand |
-| 12 | `LD r, [fa]` | `fa` is a float register holding an address |
-| 13 | `ST [fa], r` | |
+| 12 | `LD r, [addr]` | the address may live in any register, of any type |
+| 13 | `ST [addr], r` | |
 | 14 | `CVT r, r` | change type, rounding once if bits are lost |
 | 15 | `SPLIT r, r, r` | `SPLIT high, low, x` |
 | 16 | `JOIN r, r, r` | `JOIN x, high, low` |
@@ -232,8 +246,10 @@ trace is the `inexact` flag, which nothing reads.  (`stall.mant`,
 a 48-bit counter that walks through the wall, and prints itself in decimal
 with nothing but chop and mod.  (`bignum.mant`)
 
-**Addresses are significands.**  Float addresses reach 2^24 cells and no
-further.
+**Addresses are significands.**  A pointer reaches as far as its format can
+count: a half pointer stops at 2,048 cells, a float pointer at 2^24, a double
+pointer at 2^53 -- a 512^3 voxel volume needs 134 million cells, which is a
+double's to give and a float's to refuse.
 
 **There are no bit operations.**  A number has a sign, an exponent and a
 significand, and the machine offers exactly those.

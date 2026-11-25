@@ -403,8 +403,7 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
             M1_GO(pc + 8);
         }
 
-        case LD: {  // fa is a float register holding an address
-            if (file_of(b) != 1) return fail(c, FAULT_ILLEGAL);
+        case LD: {  // the address may come from any file: a pointer's type is its reach
             uint32_t index;
             uint32_t width = (uint32_t)FORMATS[fa].cells;
             if (!address(double_of(R[b]), width, true, c.size, index)) return fail(c, FAULT_ADDRESS);
@@ -413,7 +412,6 @@ M1_HD uint32_t step(Ctx& c, Effects& fx) {
         }
 
         case ST: {
-            if (file_of(a) != 1) return fail(c, FAULT_ILLEGAL);
             uint32_t index;
             uint32_t width = (uint32_t)FORMATS[file_of(b)].cells;
             if (!address(double_of(R[a]), width, true, c.size, index)) return fail(c, FAULT_ADDRESS);

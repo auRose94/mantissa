@@ -157,7 +157,6 @@ class CastsThatKeepWhatAPlainCastDrops(unittest.TestCase):
             (isa.encode(o["JOIN"], 64, 32, 1), "JOIN reads its two parts from registers of one type"),
             (isa.encode(o["ADD"], 0, 33, 2), "ADD needs operands of one type"),
             (isa.encode(o["CVT"], 32, 33, 0), "CVT changes type"),
-            (isa.encode(o["LD"], 0, 1, 0), "LD reads its address from a float register"),
             (isa.encode(o["JMP"], 0, 0, 0), "JMP reads its target from a float register"),
         ]
         for number, fragment in cases:

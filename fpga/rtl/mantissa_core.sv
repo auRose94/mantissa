@@ -416,8 +416,7 @@ module mantissa_core
         d_types = (fa == fb) && (fb == fc)
                   && (g_a <= 7'd32) && (g_b <= 7'd32) && (g_c <= 7'd32);
       end
-      C_LD:                                            d_types = (fb == mantissa_pkg::FMT_F);
-      C_ST:                                            d_types = (fa == mantissa_pkg::FMT_F);
+      C_LD, C_ST:                                      d_types = 1'b1;  // a pointer's type is its reach
       C_JMP, C_JAL:                                    d_types = (fa == mantissa_pkg::FMT_F);
       C_BCMP:                                          d_types = (fa == fb);
       default: ;

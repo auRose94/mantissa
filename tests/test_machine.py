@@ -11,9 +11,9 @@ from . import support
 TWO_24 = 16777216.0
 
 
-def run(source, steps=200_000):
+def run(source, steps=200_000, cells=4096):
     """(output, final Cpu, symbols) for a snippet."""
-    out, result, _, image = support.run_source(source, steps=steps)
+    out, result, _, image = support.run_source(source, steps=steps, cells=cells)
     return out, result.cpu, image.symbols
 
 
@@ -236,11 +236,53 @@ class Addresses(unittest.TestCase):
         out, cpu, _ = run("LDI.F f0, 4096\nJMP f0\nHALT")
         self.assertEqual((cpu.status, cpu.fault.detail), (FAULT, "4096: past the end of memory"))
 
-    def test_a_half_register_is_not_an_address(self):
-        # Addresses live in float registers; a half would only reach the first 2048 cells.
-        with self.assertRaises(asm.AsmError) as caught:
-            asm.assemble("LDI.H h0, 4\nLD.H h1, [h0]\nHALT")
-        self.assertIn("float register", caught.exception.message)
+    def test_a_pointer_type_is_its_reach(self):
+        # an address may come from any file; the memory still faults on any
+        # value that is not a whole, in-range, aligned cell number
+        out, cpu, _ = run("""
+            LDI.H  h0, 4
+            LDI.H  h1, 305
+            ST.H   [h0], h1        ; a half pointer stores
+            LD.H   h2, [h0]
+            PUT.H  h2
+            LDI.D  d0, 8
+            LDI.D  d1, 2500
+            ST.D   [d0], d1        ; a double pointer stores
+            LD.D   d2, [d0]
+            PUT.D  d2
+            HALT
+        """)
+        self.assertEqual(out.splitlines(), ["305.0", "2500.0"])
+
+    def test_a_float_pointer_slides_where_a_double_pointer_hits(self):
+        # cell 2^24 + 1 exists in a big enough memory; no float can name it,
+        # and a float pointer rounds silently onto the neighbour.  The same
+        # cell through a double pointer is exact.  This is the hazard the
+        # address ramp exists for.
+        out, cpu, _ = run("""
+            LDI.D  d0, 16777217
+            LDI.H  h1, 4660
+            ST.H   [d0], h1
+            LD.H   h2, [d0]
+            PUT.H  h2
+            LDI.F  f0, 16777217
+            LD.H   h3, [f0]
+            PUT.H  h3
+            HALT
+        """, cells=2**25)
+        self.assertEqual(out.splitlines(), ["4660.0", "0.0"])
+
+    def test_a_far_pointer_crosses_the_float_wall(self):
+        # a SPLIT pair carries a cell number past 2^24; JOINed into a double
+        # it is an address LD can use -- if memory reaches that far
+        out, cpu, _ = run("""
+            LDI.D  d0, 100000000000
+            SPLIT  f1, f2, d0
+            JOIN   d3, f1, f2
+            PUT.D  d3              ; the pair rode through a double
+            HALT
+        """)
+        self.assertEqual(out.splitlines(), ["100000000000.0"])
 
 
 class ControlFlow(unittest.TestCase):
