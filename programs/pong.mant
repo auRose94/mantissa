@@ -1,0 +1,145 @@
+; pong.mant -- the screen device, interactive: a paddle you steer, a ball that bounces.
+;
+; Memory the console and the program share:
+;   input: SPACE 8   key cells as doubles: [up, down, left, right, ...], 1.0 pressed
+;   ball:  SPACE 4   bx, by, vx, vy -- the ball's place and speed
+;   pad:   SPACE 1   px -- the paddle's middle
+;   fb:    SPACE 12288      64 by 48 doubles, the usual convention
+;
+; The console (gpu/python/screen.py --keys) reads the terminal and writes the
+; key cells each frame; this program reads them, steps the physics, and
+; paints.  The paddle follows the left and right arrows (or a/d); the ball
+; bounces off three walls, off the paddle, and resets when it escapes past
+; the bottom.  The physics are branchless where it counts: a bounce is
+; v' = v + mask * (what the bounce would be - v), the mask a 1.0 or 0.0
+; multiply -- the same trick Mantissa Dodge uses for collisions.
+
+        LDI.F  f3, 4           ; the pixel stride
+        LDI.D  d6, 256         ; the colour modulus is not used here, but
+        LDI.D  d12, 1          ;   the counters' step is
+        LDI.D  d13, 64         ; the width
+        LDI.D  d14, 48         ; the height
+        LDI.D  d16, 255        ; white: 255*65536 + 255*256 + 255 comes in two steps
+        LDI.D  d17, 16777215   ; white, packed
+        LDI.D  d18, 51400     ; cyan, packed: 0*65536 + 200*256 + 200
+frame:
+        ; ---- the state step: the console has written the key cells ----
+        LDI.F  f10, ball
+        LD.D   d20, [f10]      ; bx
+        LDI.F  f11, ball + 4
+        LD.D   d21, [f11]      ; by
+        LDI.F  f12, ball + 8
+        LD.D   d22, [f12]      ; vx
+        LDI.F  f13, ball + 12
+        LD.D   d23, [f13]      ; vy
+        LDI.F  f14, pad
+        LD.D   d24, [f14]      ; px
+        LDI.F  f15, input + 8
+        LD.D   d25, [f15]      ; left key
+        LDI.F  f16, input + 12
+        LD.D   d26, [f16]      ; right key
+        SUB.D  d25, d26, d25   ; steer: px += (right - left) * 3
+        LDI.D  d27, 3
+        MUL.D  d25, d25, d27
+        ADD.D  d24, d24, d25
+        LDI.D  d27, 59
+        MIN.D  d24, d24, d27   ; the clamps the ISA hands you for free
+        LDI.D  d27, 4
+        MAX.D  d24, d24, d27
+        ADD.D  d20, d20, d22   ; the ball moves
+        ADD.D  d21, d21, d23
+        ABS.D  d25, d22        ; left wall: if bx < 1, vx becomes |vx|
+        LDI.D  d27, 1
+        LT.D   d26, d20, d27
+        SUB.D  d27, d25, d22
+        FMA.D  d22, d26, d27   ; vx += cl * (|vx| - vx)
+        ADD.D  d25, d22, d22   ; right wall: if 63 < bx, vx becomes -vx
+        LDI.D  d27, 63
+        LT.D   d26, d27, d20
+        NEG.D  d27, d25
+        FMA.D  d22, d26, d27   ; vx += cr * (-2vx)
+        ABS.D  d25, d23        ; top wall: if by < 1, vy becomes |vy|
+        LDI.D  d27, 1
+        LT.D   d26, d21, d27
+        SUB.D  d27, d25, d23
+        FMA.D  d23, d26, d27   ; vy += ct * (|vy| - vy)
+        SUB.D  d25, d20, d24   ; the paddle: if 43 < by and |bx - px| < 5,
+        ABS.D  d25, d25        ;   vy becomes -(|vy| ... ) -- the bounce up
+        LDI.D  d27, 5
+        LT.D   d26, d25, d27
+        LDI.D  d27, 43
+        LT.D   d25, d27, d21
+        MUL.D  d26, d26, d25   ; both masks at once: multiply is AND
+        ABS.D  d25, d23
+        ADD.D  d27, d23, d25
+        NEG.D  d27, d27
+        FMA.D  d23, d26, d27   ; vy += cp * -(vy + |vy|)
+        LDI.D  d27, 47         ; past the bottom: the ball resets to the middle
+        LT.D   d26, d27, d21
+        LDI.D  d27, 32
+        SUB.D  d25, d27, d20
+        FMA.D  d20, d26, d25   ; bx += cb * (32 - bx)
+        LDI.D  d27, 24
+        SUB.D  d25, d27, d21
+        FMA.D  d21, d26, d25   ; by += cb * (24 - by)
+        LDI.D  d27, 1
+        SUB.D  d25, d27, d22
+        FMA.D  d22, d26, d25   ; vx += cb * (1 - vx)
+        LDI.D  d27, 1
+        SUB.D  d25, d27, d23
+        FMA.D  d23, d26, d25   ; vy += cb * (1 - vy)
+        ST.D   [f10], d20
+        ST.D   [f11], d21
+        ST.D   [f12], d22
+        ST.D   [f13], d23
+        ST.D   [f14], d24
+
+        ; ---- the paint: every pixel, every frame ----
+        LDI.F  f0, fb
+        MOV.D  d3, d12
+        SUB.D  d3, d3, d12     ; y = 0
+row:
+        MOV.D  d4, d12
+        SUB.D  d4, d4, d12     ; x = 0
+px:
+        SUB.D  d5, d4, d20     ; the ball mask: |x - bx| < 2 and |y - by| < 2
+        ABS.D  d5, d5
+        LDI.D  d27, 2
+        LT.D   d5, d5, d27
+        SUB.D  d7, d3, d21
+        ABS.D  d7, d7
+        LT.D   d7, d7, d27
+        MUL.D  d5, d5, d7      ; mb
+        SUB.D  d7, d4, d24     ; the paddle mask: |x - px| < 5 and 43 < y
+        ABS.D  d7, d7
+        LDI.D  d27, 5
+        LT.D   d7, d7, d27
+        LDI.D  d27, 43
+        LT.D   d6, d27, d3
+        MUL.D  d6, d6, d7      ; mp -- d6 was free after the frame step
+        ADD.D  d8, d3, d3      ; the background: a dark green gradient by y
+        ADD.D  d8, d8, d12
+        ADD.D  d8, d8, d12     ; g = 2y + 2
+        LDI.D  d11, 256
+        MUL.D  d8, d8, d11     ; g * 256, packed alone (r = 0, b = 8)
+        LDI.D  d11, 8
+        ADD.D  d8, d8, d11
+        SUB.D  d9, d18, d8     ; the paddle composites first: cyan over bg
+        FMA.D  d9, d6, d9      ; cyan where the paddle is
+        SUB.D  d10, d17, d9    ; then the ball: white over everything
+        FMA.D  d10, d5, d10    ; white where the ball is
+        ST.D   [f0], d10
+        ADD.F  f0, f0, f3
+        ADD.D  d4, d4, d12
+        LT.D   d15, d4, d13
+        BNZ.D  d15, px
+        ADD.D  d3, d3, d12
+        LT.D   d15, d3, d14
+        BNZ.D  d15, row
+        BR     frame
+
+        ALIGN  8
+input:  SPACE  32              ; eight doubles of key cells: the console writes these
+ball:   DATA.D 32.0, 24.0, 1.0, 1.0   ; bx, by, vx, vy: the ball starts mid-court, drifting
+pad:    DATA.D 32.0            ; px: the paddle starts centred
+fb:     SPACE  12288

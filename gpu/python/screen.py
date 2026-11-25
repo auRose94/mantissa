@@ -72,9 +72,23 @@ class Console:
         self.image = asm.assemble(source)
         self.width, self.height = width, height
         self.fb = self.image.symbols["fb"]        # the label is a cell address
+        self.input_addr = self.image.symbols.get("input")  # key cells, if the program asks
         self.memory = Memory(memory_cells)
         self.memory.write(self.image.cells)
         self.cpu = Cpu(f=(0.0,) * 31 + (float(memory_cells),), pc=self.image.entry)
+
+    KEY_NAMES = ("up", "down", "left", "right")   # input cell k is key k, 1.0 pressed
+
+    def inject_keys(self, pressed):
+        """Write the key cells: 1.0 for a pressed key, 0.0 for a released one.
+        This is the whole input path -- the console writes memory, the
+        machine reads it, and neither breaks the rule."""
+        if self.input_addr is None:
+            return
+        from mantissa import fp
+        for k, name in enumerate(self.KEY_NAMES):
+            self.memory.store(fp.D, self.input_addr + 4 * k,
+                              1.0 if name in pressed else 0.0)
 
     def step(self, steps):
         """Run a burst of steps; a step limit is how a frame ends here, not a fault."""
@@ -89,9 +103,11 @@ class Console:
         image = self.frame()
         return image.tobytes()
 
-    def play(self, frames, steps_per_frame, fps=30, scale=4, record=None, pngs=None):
+    def play(self, frames, steps_per_frame, fps=30, scale=4, record=None, pngs=None, keys=False):
         """Run and watch.  One of: an ffplay window (default), --record path
-        (libx264 video), --pngs directory (snapshots every frames//6 frames)."""
+        (libx264 video), --pngs directory (snapshots every frames//6 frames).
+        With keys=True the terminal steers: arrows or wasd write the key
+        cells, q quits."""
         if record:
             pipe = subprocess.Popen(
                 ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -105,8 +121,20 @@ class Console:
                 ["ffplay", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
                  "-s", f"{self.width * scale}x{self.height * scale}", "-i", "-"],
                 stdin=subprocess.PIPE)
+        if keys:
+            import termios
+            import tty
+            old_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
         try:
+            buf = []
+            quit_now = False
             for frame in range(frames):
+                if keys:
+                    pressed, buf = read_keys(buf)
+                    if "quit" in pressed:
+                        break
+                    self.inject_keys(pressed)
                 self.step(steps_per_frame)
                 image = self.frame(scale)
                 if pipe is not None:
@@ -114,14 +142,50 @@ class Console:
                 if pngs and frame % max(1, frames // 6) == 0:
                     image.save(f"{pngs}/frame{frame:04d}.png")
         finally:
+            if keys:
+                import termios
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
             if pipe is not None:
                 pipe.stdin.close()
                 pipe.wait(timeout=10)
 
 
+KEY_CHARS = {"w": "up", "s": "down", "a": "left", "d": "right",
+             "A": "up", "B": "down", "D": "left", "C": "right"}
+
+
+def read_keys(buf):
+    """Every key ready in the terminal, as names: wasd, or the arrows as the
+    three-byte escape sequences A/B/C/D.  'q' comes back as quit."""
+    import select
+    out = set()
+    while select.select([sys.stdin], [], [], 0)[0]:
+        ch = sys.stdin.read(1)
+        buf.append(ch)
+        if ch == "q":
+            out.add("quit")
+            buf.clear()
+        elif ch in "wasd":
+            out.add(KEY_CHARS[ch])
+            buf.clear()
+        elif ch == "\x1b":
+            if len(buf) >= 3 and buf[-3] == "\x1b" and buf[-2] == "[" and buf[-1] in "ABCD":
+                out.add(KEY_CHARS[buf[-1]])
+                buf.clear()
+            # a lone escape: quit
+            elif len(buf) == 1:
+                out.add("quit")
+                buf.clear()
+        elif ch not in "[":
+            buf.clear()
+    return out, buf
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("program")
+    parser.add_argument("--keys", action="store_true",
+                        help="steer from the terminal: arrows or wasd, q quits")
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--height", type=int, default=48)
     parser.add_argument("--frames", type=int, default=120)
@@ -135,7 +199,7 @@ def main():
 
     console = Console(args.program, args.width, args.height)
     console.play(args.frames, args.steps_per_frame, args.fps, args.scale,
-                 record=args.record, pngs=args.pngs)
+                 record=args.record, pngs=args.pngs, keys=args.keys)
     return 0
 
 

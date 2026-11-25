@@ -69,3 +69,65 @@ class WatchingConsole(unittest.TestCase):
         image = console.frame()
         first = image.getpixel((0, 0))
         self.assertEqual(first[0], 4, "four finished frames: t counted to 4, r = t at the corner")
+
+
+class InteractiveInput(unittest.TestCase):
+    """Input streams in through the convention too: the console writes the
+    key cells, the machine reads them.  These tests feed inject_keys the way
+    the terminal would."""
+
+    HERE = Path(__file__).resolve().parents[1]
+
+    def console(self):
+        return Console(self.HERE / "programs" / "pong.mant", width=64, height=48)
+
+    def cell(self, console, label, which):
+        return console.image.symbols[label] + 4 * which
+
+    def read(self, console, label, which):
+        from mantissa import fp
+        return console.memory.load(fp.D, self.cell(console, label, which))
+
+    def test_a_paddle_steers_by_the_key_cells(self):
+        console = self.console()
+        pressed = {"left"}
+        console.inject_keys(pressed)
+        before = self.read(console, "pad", 0)
+        console.step(5_000)     # the physics runs at the frame's start
+        after = self.read(console, "pad", 0)
+        self.assertEqual(after, before - 3.0)   # left: px -= 3
+        console.inject_keys({"right"})
+        console.step(130_000)   # a whole frame: the next physics hides deep in the paint
+        self.assertEqual(self.read(console, "pad", 0), before)  # and back again
+
+    def test_the_ball_bounces_off_the_left_wall(self):
+        console = self.console()
+        from mantissa import fp
+        # park the ball at the left edge, drifting out
+        ball = console.image.symbols["ball"]
+        console.memory.store(fp.D, ball + 4, 24.0)      # by
+        console.memory.store(fp.D, ball, 0.5)           # bx
+        console.memory.store(fp.D, ball + 8, -1.0)      # vx: heading out
+        console.step(130_000)   # two frames: plenty for the ball to leave and return
+        self.assertEqual(self.read(console, "ball", 2), 1.0, "the left wall flips vx to +1")
+        self.assertGreaterEqual(self.read(console, "ball", 0), 0.0)
+
+    def test_the_paddle_bounces_the_ball(self):
+        console = self.console()
+        from mantissa import fp
+        ball = console.image.symbols["ball"]
+        pad = console.image.symbols["pad"]
+        console.memory.store(fp.D, pad, 32.0)           # paddle centred
+        console.memory.store(fp.D, ball, 32.0)          # bx under the paddle
+        console.memory.store(fp.D, ball + 4, 44.0)      # by just below the bounce line
+        console.memory.store(fp.D, ball + 8, 1.0)
+        console.memory.store(fp.D, ball + 12, 1.0)      # vy heading down
+        console.step(130_000)
+        self.assertEqual(self.read(console, "ball", 3), -1.0, "the paddle sends vy up")
+
+    def test_key_cells_reset_between_frames(self):
+        console = self.console()
+        console.inject_keys({"left"})
+        self.assertEqual(self.read(console, "input", 2), 1.0)
+        console.inject_keys(set())                       # a frame with nothing pressed
+        self.assertEqual(self.read(console, "input", 2), 0.0)
